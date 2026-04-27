@@ -31,7 +31,10 @@ def _init_mpi():
         world_size = 1
 
     if torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
+        local_rank = int(os.environ.get("SLURM_LOCALID", rank % torch.cuda.device_count()))
+        local_rank = min(local_rank, torch.cuda.device_count() - 1)
+        torch.cuda.set_device(local_rank)
+
     return comm, rank, world_size
 
 
@@ -423,7 +426,12 @@ def main():
     W_out = _make_out_weight(cfg, device)
 
     if args.use_nccl and world_size > 1:
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_ADDR" not in os.environ:
+            master = os.environ.get(
+                "SLURM_LAUNCH_NODE_IPADDR",
+                os.environ.get("SLURM_SRUN_COMM_HOST", "127.0.0.1"),
+            )
+            os.environ["MASTER_ADDR"] = master
         os.environ.setdefault("MASTER_PORT", "29500")
         torch.distributed.init_process_group(
             backend="nccl", rank=rank, world_size=world_size

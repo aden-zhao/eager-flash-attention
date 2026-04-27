@@ -1,6 +1,12 @@
 # Serialized Baseline — Attention → W_out → All-Reduce
 
-## Quick Start
+## Quick Start (Perlmutter)
+
+First, get an interactive allocation:
+```bash
+salloc --nodes=1 --ntasks=4 --gpus=4 --cpus-per-task=4 --account=m4341 --qos=interactive --constraint=gpu --time=30:00
+module load pytorch
+```
 
 ### Single GPU or CPU debugging (no MPI needed)
 ```bash
@@ -9,20 +15,24 @@ python serialized_baseline.py --seq_len 512
 
 ### Multi-GPU with mpi4py (CPU all-reduce, for debugging)
 ```bash
-mpirun -np 4 python serialized_baseline.py --seq_len 1024
+srun -n 4 --gpus=4 --gpu-bind=none python serialized_baseline.py --seq_len 1024
 ```
 
 ### Multi-GPU with NCCL (GPU all-reduce, for benchmarking)
 ```bash
-mpirun -np 4 python serialized_baseline.py --seq_len 1024 --use_nccl
+srun -n 4 --gpus=4 --gpu-bind=none python serialized_baseline.py --seq_len 1024 --use_nccl
 ```
 
 > **Note:** Always use `--use_nccl` for benchmark numbers. The mpi4py path
 > round-trips through CPU, so its all-reduce time is dominated by PCIe
 > transfer rather than actual collective cost.
 
+> **GPU binding:** On Perlmutter, use `srun -n <N> --gpus=<N> --gpu-bind=none`
+> rather than `--gpus-per-task=1`. The latter sets `CUDA_VISIBLE_DEVICES=0` for
+> all ranks, causing NCCL to fail with `invalid device ordinal`.
+
 > **Port collisions:** NCCL defaults to `MASTER_PORT=29500`. If multiple jobs
-> share a node, set a different port: `MASTER_PORT=29501 mpirun -np 4 ...`
+> share a node, set a different port: `MASTER_PORT=29501 srun -n 4 ...`
 
 ## What It Does
 
