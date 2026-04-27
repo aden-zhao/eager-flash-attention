@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(tile_comm LANGUAGES CXX CUDA)
 
-find_package(MPI REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(tile_comm tile_comm.cu)
@@ -12,13 +11,25 @@ set_target_properties(tile_comm PROPERTIES
     CUDA_ARCHITECTURES 80
 )
 
-target_link_libraries(tile_comm
-    PRIVATE
-    MPI::MPI_CXX
-    CUDA::cudart
-    CUDA::cublas
+# Perlmutter Cray MPICH include path.
+target_include_directories(tile_comm PRIVATE
+    /opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/include
 )
 
-# Enable this later if nvToolsExt is available and you want NVTX ranges.
-# target_link_libraries(tile_comm PRIVATE CUDA::nvToolsExt)
-# target_compile_definitions(tile_comm PRIVATE USE_NVTX=1)
+# Perlmutter Cray MPICH + CUDA GTL library paths.
+target_link_directories(tile_comm PRIVATE
+    /opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/lib
+    /opt/cray/pe/mpich/9.0.1/gtl/lib
+)
+
+target_link_libraries(tile_comm PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    mpi_gnu_123
+    mpi_gtl_cuda
+)
+
+# Helps prevent the linker from dropping GTL-related libraries.
+target_link_options(tile_comm PRIVATE
+    -Wl,--no-as-needed
+)
