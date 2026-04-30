@@ -52,6 +52,7 @@
     } while (0)
 
 enum class Mode { SERIALIZED_FULL, SERIALIZED, TILED, OVERLAP };
+enum class ComputeKind { SYNTHETIC, BASELINE };
 enum class CudaAwareStatus { YES, NO, UNKNOWN };
 
 struct TileDesc {
@@ -105,6 +106,8 @@ struct InFlight {
 
 Mode parse_mode(int argc, char** argv);
 const char* mode_str(Mode m);
+ComputeKind parse_compute(int argc, char** argv);
+const char* compute_str(ComputeKind c);
 CudaAwareStatus detect_cuda_aware_mpi();
 const char* cuda_aware_str(CudaAwareStatus s);
 int parse_int(int argc, char** argv, const char* name, int def);
