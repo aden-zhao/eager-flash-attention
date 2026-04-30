@@ -3,7 +3,7 @@ project(tile_comm LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
-add_executable(tile_comm tile_comm.cu)
+add_executable(tile_comm tile_comm.cu baseline_attention.cu)
 
 set_target_properties(tile_comm PROPERTIES
     CXX_STANDARD 17

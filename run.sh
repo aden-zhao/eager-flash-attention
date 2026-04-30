@@ -16,6 +16,8 @@ cd ..
 
 # CLI reference:
 #   --mode             serialized_full | serialized | tiled | overlap
+#   --compute          synthetic | baseline   (default synthetic)
+#                      baseline = naive softmax attention + sample QKV (fma_iters ignored)
 #   --num_tiles        Number of sequence tiles (default 8)
 #   --tile_elems       Pre-projection tile size (default 1048576)
 #   --num_buffers      Pipeline depth, overlap mode only (default 2)
@@ -27,11 +29,11 @@ cd ..
 TILES=${TILES:-8}
 ELEMS=${ELEMS:-1048576}
 FMA=${FMA:-200}
+COMPUTE=${COMPUTE:-synthetic}
 TRIALS=${TRIALS:-3}
 BIN=${BIN:-./build/tile_comm}
 
 # Common srun options:
-# one MPI rank per GPU, with Slurm binding each rank to one GPU.
 SRUN_GPU_FLAGS=${SRUN_GPU_FLAGS:-"--gpus-per-task=1 --gpu-bind=single:1"}
 
 run_sweep() {
@@ -45,6 +47,7 @@ run_sweep() {
             echo "===== ${MODE}, ${NGPUS} GPU(s) ====="
             srun -n ${NGPUS} ${SRUN_GPU_FLAGS} ${BIN} \
                 --mode ${MODE} \
+                --compute ${COMPUTE} \
                 --num_tiles ${TILES} --tile_elems ${ELEMS} --fma_iters ${FMA}
         done
 
@@ -52,6 +55,7 @@ run_sweep() {
         echo "===== overlap, ${NGPUS} GPU(s) ====="
         srun -n ${NGPUS} ${SRUN_GPU_FLAGS} ${BIN} \
             --mode overlap \
+            --compute ${COMPUTE} \
             --num_tiles ${TILES} --tile_elems ${ELEMS} --fma_iters ${FMA} \
             --num_buffers 2 --max_inflight 1 --aggregate_tiles 1
     done
@@ -73,6 +77,7 @@ run_sweep() {
         echo "===== tiled, aggregate_tiles=${AGG} ====="
         srun -n 4 ${SRUN_GPU_FLAGS} ${BIN} \
             --mode tiled \
+            --compute ${COMPUTE} \
             --num_tiles ${TILES} --tile_elems ${ELEMS} --fma_iters ${FMA} \
             --aggregate_tiles ${AGG}
 
@@ -80,6 +85,7 @@ run_sweep() {
         echo "===== overlap, aggregate_tiles=${AGG} ====="
         srun -n 4 ${SRUN_GPU_FLAGS} ${BIN} \
             --mode overlap \
+            --compute ${COMPUTE} \
             --num_tiles ${TILES} --tile_elems ${ELEMS} --fma_iters ${FMA} \
             --num_buffers 4 --max_inflight 1 --aggregate_tiles ${AGG}
     done
@@ -94,6 +100,7 @@ run_sweep() {
         echo "===== overlap, max_inflight=${INF} ====="
         srun -n 4 ${SRUN_GPU_FLAGS} ${BIN} \
             --mode overlap \
+            --compute ${COMPUTE} \
             --num_tiles ${TILES} --tile_elems ${ELEMS} --fma_iters ${FMA} \
             --num_buffers ${INF} --max_inflight ${INF} --aggregate_tiles 1
     done
@@ -109,6 +116,7 @@ for TRIAL in $(seq 1 ${TRIALS}); do
     echo ""
     echo "###############################################"
     echo "# Trial ${TRIAL}/${TRIALS}"
+    echo "# compute=${COMPUTE}"
     echo "# Log: ${LOG}"
     echo "# Results: ${RESULT_DIR}/"
     echo "###############################################"
@@ -122,3 +130,4 @@ mkdir -p results
 echo ""
 echo "Done. Logs: logs_large_fma${FMA}_run*.txt"
 echo "Done. CSV timeline directories: results_large_fma${FMA}_run*/"
+echo "Tip: baseline attention GPU timings → COMPUTE=baseline ./run.sh"

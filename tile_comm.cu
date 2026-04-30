@@ -4,11 +4,17 @@
  *   serialized      : compute all -> project all -> allreduce per tile
  *   tiled           : compute+project per tile -> sync -> grouped allreduce
  *   overlap         : compute+project+allreduce pipelined per tile group
+ *
+ * Compute path (--compute):
+ *   synthetic : fill_tile_kernel + fma_iters (default)
+ *   baseline  : naive softmax attention + sample QKV (baseline_attention.cu)
  */
 
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+
+#include "baseline_attention.cuh"
 
 #include <algorithm>
 #include <cassert>
@@ -116,6 +122,32 @@ static const char* mode_str(Mode m) {
         case Mode::SERIALIZED:      return "serialized";
         case Mode::TILED:           return "tiled";
         case Mode::OVERLAP:         return "overlap";
+    }
+    return "unknown";
+}
+
+enum class ComputeKind { SYNTHETIC, BASELINE };
+
+static ComputeKind parse_compute(int argc, char** argv) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--compute") == 0) {
+            if (std::strcmp(argv[i + 1], "synthetic") == 0)
+                return ComputeKind::SYNTHETIC;
+            if (std::strcmp(argv[i + 1], "baseline") == 0)
+                return ComputeKind::BASELINE;
+            fprintf(stderr,
+                    "Unknown --compute: %s (options: synthetic, baseline)\n",
+                    argv[i + 1]);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    return ComputeKind::SYNTHETIC;
+}
+
+static const char* compute_str(ComputeKind c) {
+    switch (c) {
+        case ComputeKind::SYNTHETIC: return "synthetic";
+        case ComputeKind::BASELINE:  return "baseline";
     }
     return "unknown";
 }
@@ -427,6 +459,7 @@ int main(int argc, char** argv) {
 
     /* Parse CLI */
     Mode mode = parse_mode(argc, argv);
+    ComputeKind compute_kind = parse_compute(argc, argv);
 
     const int num_tiles       = parse_int(argc, argv, "--num_tiles",       8);
     const int tile_elems      = parse_int(argc, argv, "--tile_elems",      1024 * 1024);
@@ -482,13 +515,17 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         std::cout << "Tile communication benchmark (v4.2)\n"
                   << "  mode             = " << mode_str(mode) << "\n"
+                  << "  compute          = " << compute_str(compute_kind) << "\n"
                   << "  world_size       = " << world_size     << "\n"
                   << "  num_tiles        = " << num_tiles      << "\n"
                   << "  tile_elems       = " << tile_elems     << "\n"
                   << "  num_buffers      = " << num_buffers    << "\n"
                   << "  max_inflight     = " << max_inflight   << "\n"
                   << "  aggregate_tiles  = " << aggregate_tiles << "\n"
-                  << "  fma_iters        = " << fma_iters      << "\n"
+                  << "  fma_iters        = " << fma_iters;
+        if (compute_kind == ComputeKind::BASELINE)
+            std::cout << " (ignored for baseline attention)";
+        std::cout << "\n"
                   << "  proj (MxKxN)     = " << proj_m << "x" << proj_k
                   << "x" << proj_n << "\n"
                   << "  output tile      = " << output_tile_elems << " elems\n"
@@ -537,6 +574,23 @@ int main(int argc, char** argv) {
                               static_cast<size_t>(tile_elems) * sizeof(float)));
         CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_events[p],
                                             cudaEventDisableTiming));
+    }
+
+    float* baseline_Q = nullptr;
+    float* baseline_K = nullptr;
+    float* baseline_V = nullptr;
+    float* baseline_workspace = nullptr;
+    size_t baseline_workspace_bytes = 0;
+
+    if (compute_kind == ComputeKind::BASELINE) {
+        CUDA_CHECK(cudaMalloc(&baseline_Q,
+                              static_cast<size_t>(tile_elems) * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&baseline_K,
+                              static_cast<size_t>(tile_elems) * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&baseline_V,
+                              static_cast<size_t>(tile_elems) * sizeof(float)));
+        baseline_workspace_bytes = baseline_attention_workspace_bytes(proj_m);
+        CUDA_CHECK(cudaMalloc(&baseline_workspace, baseline_workspace_bytes));
     }
 
     /* W_ot weight matrix (proj_k x proj_n) */
@@ -599,16 +653,38 @@ int main(int argc, char** argv) {
     /* Helper: compute + project one tile */
 
     auto compute_one = [&](int tile, int buf) {
-        float base_value = static_cast<float>((rank + 1) * 1000 + (tile + 1));
-        int threads = 256;
-        int blocks  = (tile_elems + threads - 1) / threads;
-
         compute_enqueue_start[tile] = MPI_Wtime();
         CUDA_CHECK(cudaEventRecord(ev_comp_start[tile], compute_stream));
 
-        fill_tile_kernel<<<blocks, threads, 0, compute_stream>>>(
-            pre_proj_buffers[buf], tile_elems, base_value, fma_iters);
-        CUDA_CHECK(cudaGetLastError());
+        if (compute_kind == ComputeKind::SYNTHETIC) {
+            float base_value =
+                static_cast<float>((rank + 1) * 1000 + (tile + 1));
+            int threads = 256;
+            int blocks = (tile_elems + threads - 1) / threads;
+            fill_tile_kernel<<<blocks, threads, 0, compute_stream>>>(
+                pre_proj_buffers[buf], tile_elems, base_value, fma_iters);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            launch_baseline_attention_fill_sample_qkv(
+                compute_stream,
+                baseline_Q,
+                baseline_K,
+                baseline_V,
+                proj_m,
+                proj_k,
+                rank,
+                tile);
+            launch_baseline_attention(
+                compute_stream,
+                baseline_Q,
+                baseline_K,
+                baseline_V,
+                pre_proj_buffers[buf],
+                baseline_workspace,
+                baseline_workspace_bytes,
+                proj_m,
+                proj_k);
+        }
 
         CUDA_CHECK(cudaEventRecord(ev_comp_stop[tile], compute_stream));
         CUDA_CHECK(cudaEventRecord(compute_done_events[buf], compute_stream));
@@ -838,20 +914,44 @@ int main(int argc, char** argv) {
                 int tile = first_tile + t;
                 int pre_buf = buf * aggregate_tiles + t;  // per-tile pre_proj slot
 
-                // Compute
-                float base_value = static_cast<float>((rank + 1) * 1000 + (tile + 1));
-                int threads = 256;
-                int blocks  = (tile_elems + threads - 1) / threads;
-
                 compute_enqueue_start[tile] = MPI_Wtime();
                 CUDA_CHECK(cudaEventRecord(ev_comp_start[tile], compute_stream));
 
-                fill_tile_kernel<<<blocks, threads, 0, compute_stream>>>(
-                    pre_proj_buffers[pre_buf], tile_elems, base_value, fma_iters);
-                CUDA_CHECK(cudaGetLastError());
+                if (compute_kind == ComputeKind::SYNTHETIC) {
+                    float base_value =
+                        static_cast<float>((rank + 1) * 1000 + (tile + 1));
+                    int threads = 256;
+                    int blocks =
+                        (tile_elems + threads - 1) / threads;
+                    fill_tile_kernel<<<blocks, threads, 0, compute_stream>>>(
+                        pre_proj_buffers[pre_buf], tile_elems, base_value,
+                        fma_iters);
+                    CUDA_CHECK(cudaGetLastError());
+                } else {
+                    launch_baseline_attention_fill_sample_qkv(
+                        compute_stream,
+                        baseline_Q,
+                        baseline_K,
+                        baseline_V,
+                        proj_m,
+                        proj_k,
+                        rank,
+                        tile);
+                    launch_baseline_attention(
+                        compute_stream,
+                        baseline_Q,
+                        baseline_K,
+                        baseline_V,
+                        pre_proj_buffers[pre_buf],
+                        baseline_workspace,
+                        baseline_workspace_bytes,
+                        proj_m,
+                        proj_k);
+                }
 
                 CUDA_CHECK(cudaEventRecord(ev_comp_stop[tile], compute_stream));
-                CUDA_CHECK(cudaEventRecord(compute_done_events[pre_buf], compute_stream));
+                CUDA_CHECK(cudaEventRecord(compute_done_events[pre_buf],
+                                           compute_stream));
                 compute_enqueue_end[tile] = MPI_Wtime();
 
                 // Project into aggregated send buffer at correct offset
@@ -942,28 +1042,63 @@ int main(int argc, char** argv) {
                           cudaMemcpyDeviceToHost));
 
     int bad = 0;
+    std::vector<float> expected_baseline_tile(output_tile_elems);
+
     for (int tile = 0; tile < num_tiles; ++tile) {
-        float expected_sum = 0.0f;
-        for (int r = 0; r < world_size; ++r) {
-            float base = static_cast<float>((r + 1) * 1000 + (tile + 1));
-            float kernel_out = compute_expected_kernel_output(base, fma_iters);
-            expected_sum += kernel_out * 0.01f * static_cast<float>(proj_k);
-        }
-
-        float tol = std::fabs(expected_sum) * 1e-3f + 1e-4f;
-
         size_t offset = static_cast<size_t>(tile) * output_tile_elems;
-        for (size_t i = 0; i < output_tile_elems; ++i) {
-            if (std::fabs(output_host[offset + i] - expected_sum) > tol) {
-                bad++;
-                if (bad < 10) {
-                    std::cerr << "Rank " << rank
-                              << " tile " << tile
-                              << " elem " << i
-                              << ": got " << output_host[offset + i]
-                              << ", expected " << expected_sum
-                              << " (diff " << std::fabs(output_host[offset + i] - expected_sum)
-                              << ", tol " << tol << ")\n";
+
+        if (compute_kind == ComputeKind::SYNTHETIC) {
+            float expected_sum = 0.0f;
+            for (int r = 0; r < world_size; ++r) {
+                float base = static_cast<float>((r + 1) * 1000 + (tile + 1));
+                float kernel_out =
+                    compute_expected_kernel_output(base, fma_iters);
+                expected_sum +=
+                    kernel_out * 0.01f * static_cast<float>(proj_k);
+            }
+
+            float tol = std::fabs(expected_sum) * 1e-3f + 1e-4f;
+
+            for (size_t i = 0; i < output_tile_elems; ++i) {
+                if (std::fabs(output_host[offset + i] - expected_sum) > tol) {
+                    bad++;
+                    if (bad < 10) {
+                        std::cerr << "Rank " << rank << " tile " << tile
+                                  << " elem " << i << ": got "
+                                  << output_host[offset + i] << ", expected "
+                                  << expected_sum << " (diff "
+                                  << std::fabs(output_host[offset + i] -
+                                                expected_sum)
+                                  << ", tol " << tol << ")\n";
+                    }
+                }
+            }
+        } else {
+            baseline_attention_host_expected_after_allreduce(
+                tile,
+                world_size,
+                proj_m,
+                proj_k,
+                proj_n,
+                0.01f,
+                expected_baseline_tile.data(),
+                output_tile_elems);
+
+            for (size_t i = 0; i < output_tile_elems; ++i) {
+                float expected = expected_baseline_tile[i];
+                float tol =
+                    std::fabs(expected) * 1e-3f + 1e-4f;
+                if (std::fabs(output_host[offset + i] - expected) > tol) {
+                    bad++;
+                    if (bad < 10) {
+                        std::cerr << "Rank " << rank << " tile " << tile
+                                  << " elem " << i << ": got "
+                                  << output_host[offset + i] << ", expected "
+                                  << expected << " (diff "
+                                  << std::fabs(output_host[offset + i] -
+                                                expected)
+                                  << ", tol " << tol << ")\n";
+                    }
                 }
             }
         }
@@ -1070,6 +1205,7 @@ int main(int argc, char** argv) {
 
         std::string fname = "results/tile_timeline_"
             + std::string(mode_str(mode))
+            + "_compute_" + std::string(compute_str(compute_kind))
             + "_rank" + std::to_string(rank)
             + "_ngpu" + std::to_string(world_size)
             + "_tiles" + std::to_string(num_tiles)
@@ -1161,6 +1297,15 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaFree(W_out_device));
     CUDA_CHECK(cudaFree(output_device));
+
+    if (baseline_Q)
+        CUDA_CHECK(cudaFree(baseline_Q));
+    if (baseline_K)
+        CUDA_CHECK(cudaFree(baseline_K));
+    if (baseline_V)
+        CUDA_CHECK(cudaFree(baseline_V));
+    if (baseline_workspace)
+        CUDA_CHECK(cudaFree(baseline_workspace));
 
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     CUDA_CHECK(cudaStreamDestroy(proj_stream));
