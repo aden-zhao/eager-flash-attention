@@ -39,15 +39,12 @@ int main(int argc, char** argv)
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
     CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
 
-    // H divisible by 4 so cases run on 1, 2, or 4 GPUs without change.
-    // B_M <= 32 (thread limit: B_M * 32 <= 1024).
-    // S % B_M == 0 and S % B_N == 0.
     const TestCase cases[] = {
-        {  128,  64, 4, 16, 16 },  // tiny, baseline smoke test
-        {  256, 128, 8, 32, 32 },  // standard config
-        {  512, 128, 8, 32, 64 },  // B_N > B_M: larger KV tiles
-        {  512, 256, 8, 16, 32 },  // small B_M: many tiles (32 tiles)
-        { 1024, 256, 8, 32, 64 },  // larger S
+        {  128,  64, 4, 16, 16 },
+        {  256, 128, 8, 32, 32 },
+        {  512, 128, 8, 32, 64 },
+        {  512, 256, 8, 16, 32 },
+        { 1024, 256, 8, 32, 64 },
     };
     const int seeds[] = { 42, 123, 777 };
 
@@ -55,6 +52,12 @@ int main(int argc, char** argv)
 
     for (const auto& tc : cases) {
         AttnParams p = make_params(tc.S, tc.d, tc.H, tc.B_M, tc.B_N, world_size);
+
+        if (tc.H % world_size != 0) {
+            if (rank == 0)
+                printf("SKIP S=%d H=%d: H not divisible by R=%d\n", tc.S, tc.H, world_size);
+            continue;
+        }
 
         if (!flash_attn_check_params(p.flash, device)) {
             if (rank == 0)
@@ -75,23 +78,21 @@ int main(int argc, char** argv)
 
             const size_t out_bytes = (size_t)p.S * p.d * sizeof(float);
             float *out_meg, *out_sync, *out_overlap, *out_base;
-            CUDA_CHECK(cudaMalloc(&out_meg,     out_bytes));
-            CUDA_CHECK(cudaMalloc(&out_sync,    out_bytes));
+            CUDA_CHECK(cudaMalloc(&out_meg, out_bytes));
+            CUDA_CHECK(cudaMalloc(&out_sync, out_bytes));
             CUDA_CHECK(cudaMalloc(&out_overlap, out_bytes));
-            CUDA_CHECK(cudaMalloc(&out_base,    out_bytes));
+            CUDA_CHECK(cudaMalloc(&out_base, out_bytes));
 
-            // --- three pipeline modes ---
-            run_megatron(w.Q, w.K, w.V, w.W_O, out_meg,     p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-            run_sync    (w.Q, w.K, w.V, w.W_O, out_sync,    p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-            run_overlap (w.Q, w.K, w.V, w.W_O, out_overlap, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
+            run_megatron(w.Q, w.K, w.V, w.W_O, out_meg, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
+            run_sync(w.Q, w.K, w.V, w.W_O, out_sync, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
+            run_overlap(w.Q, w.K, w.V, w.W_O, out_overlap, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
 
-            // --- baseline: per-rank attention + project + allreduce ---
             {
-                float* O_attn  = nullptr;
+                float* O_attn = nullptr;
                 float* P_local = nullptr;
                 float* workspace = nullptr;
-                CUDA_CHECK(cudaMalloc(&O_attn,    (size_t)p.S * p.d_local * sizeof(float)));
-                CUDA_CHECK(cudaMalloc(&P_local,   out_bytes));
+                CUDA_CHECK(cudaMalloc(&O_attn, (size_t)p.S * p.d_local * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&P_local, out_bytes));
                 CUDA_CHECK(cudaMalloc(&workspace, baseline_attention_workspace_bytes(p.S)));
 
                 baseline_attention(w.Q, w.K, w.V, O_attn, workspace,
@@ -103,9 +104,9 @@ int main(int argc, char** argv)
                 CUBLAS_CHECK(cublasSgemm(cublas_handle,
                     CUBLAS_OP_N, CUBLAS_OP_N,
                     p.d, p.S, p.d_local,
-                    &alpha, w.W_O,   p.d,
-                            O_attn,  p.d_local,
-                    &beta,  P_local, p.d));
+                    &alpha, w.W_O, p.d,
+                            O_attn, p.d_local,
+                    &beta, P_local, p.d));
                 CUDA_CHECK(cudaStreamSynchronize(proj_stream));
 
                 MPI_CHECK(MPI_Allreduce(P_local, out_base,
@@ -116,22 +117,19 @@ int main(int argc, char** argv)
                 CUDA_CHECK(cudaFree(workspace));
             }
 
-            // --- compare on rank 0 ---
             if (rank == 0) {
                 const size_t n = (size_t)p.S * p.d;
                 std::vector<float> h_meg(n), h_sync(n), h_overlap(n), h_base(n);
-                CUDA_CHECK(cudaMemcpy(h_meg.data(),     out_meg,     out_bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_sync.data(),    out_sync,    out_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_meg.data(), out_meg, out_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_sync.data(), out_sync, out_bytes, cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(h_overlap.data(), out_overlap, out_bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_base.data(),    out_base,    out_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_base.data(), out_base, out_bytes, cudaMemcpyDeviceToHost));
 
                 const float atol = 1e-3f;
                 bool ok = true;
-                ok &= check("megatron vs baseline",  h_meg.data(),     h_base.data(),    n, atol);
-                ok &= check("sync vs baseline",      h_sync.data(),    h_base.data(),    n, atol);
-                ok &= check("overlap vs baseline",   h_overlap.data(), h_base.data(),    n, atol);
-                ok &= check("sync vs megatron",      h_sync.data(),    h_meg.data(),     n, atol);
-                ok &= check("overlap vs megatron",   h_overlap.data(), h_meg.data(),     n, atol);
+                ok &= check("megatron vs baseline", h_meg.data(), h_base.data(), n, atol);
+                ok &= check("sync vs baseline", h_sync.data(), h_base.data(), n, atol);
+                ok &= check("overlap vs baseline", h_overlap.data(), h_base.data(), n, atol);
 
                 if (ok) total_pass++; else total_fail++;
             }
