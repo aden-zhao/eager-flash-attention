@@ -1,7 +1,0 @@
-# Compiled Binaries and Object Files
-*.o
-pipeline_dist_attn
-
-# Large Raw Execution Logs (Keep the CSV summaries instead)
-results/results_mode*.log
-results/validation.log
