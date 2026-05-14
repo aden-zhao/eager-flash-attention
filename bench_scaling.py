@@ -7,7 +7,7 @@ BENCH = "./attn_bench"
 B_N = 64
 B_M = int(sys.argv[1]) if len(sys.argv) > 1 else 16
 
-S_VALUES = [1024, 4096, 16384, 65536]
+S_VALUES = [1024, 4096, 16384]
 D_VALUES = [1, 2, 4]
 
 for S in S_VALUES:

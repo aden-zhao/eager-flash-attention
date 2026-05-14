@@ -7,7 +7,7 @@ BENCH = "./attn_bench"
 D = 4
 B_N = 64
 
-S_VALUES  = [1024, 4096, 16384, 65536]
+S_VALUES  = [1024, 4096, 16384]
 BM_VALUES = [8, 16, 32]
 
 for S in S_VALUES:
