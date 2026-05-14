@@ -12,7 +12,6 @@
 static const int D_H = 64;
 static const int H = 16;
 static const int D_MODEL = H * D_H;
-static const int B_N = 64;
 static const int N_WARMUP = 3;
 static const int N_TRIALS = 5;
 
@@ -22,6 +21,15 @@ static int parse_int_arg(int argc, char** argv, const char* flag, int def)
         if (std::strcmp(argv[i], flag) == 0)
             return std::atoi(argv[i + 1]);
     return def;
+}
+
+static int derive_bn(int d_h)
+{
+    const int max_smem = 49152;
+    int max_bn = max_smem / (2 * d_h * (int)sizeof(float));
+    int bn = 1;
+    while (bn * 2 <= max_bn) bn *= 2;
+    return bn;
 }
 
 struct Stats {
@@ -85,6 +93,7 @@ int main(int argc, char** argv)
 
     const int S = parse_int_arg(argc, argv, "--S", 4096);
     const int B_M = parse_int_arg(argc, argv, "--B_M", 32);
+    const int B_N = parse_int_arg(argc, argv, "--B_N", derive_bn(D_H));
 
     AttnParams p = make_params(S, D_MODEL, H, B_M, B_N, world_size);
 
