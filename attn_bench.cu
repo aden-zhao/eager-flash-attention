@@ -52,17 +52,18 @@ static std::vector<double> time_mode(
     cudaStream_t compute_stream,
     cudaStream_t proj_stream,
     cublasHandle_t cublas_handle,
-    MPI_Comm comm)
+    MPI_Comm comm,
+    ncclComm_t nccl_comm)
 {
     std::vector<double> times;
     for (int trial = 0; trial < N_WARMUP + N_TRIALS; trial++) {
         RunResult r;
         if (mode == 0)
-            r = run_megatron(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm);
+            r = run_megatron(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm, nccl_comm);
         else if (mode == 1)
-            r = run_sync(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm);
+            r = run_sync(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm, nccl_comm);
         else
-            r = run_overlap(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm);
+            r = run_overlap(w.Q, w.K, w.V, w.W_O, output, p, compute_stream, proj_stream, cublas_handle, comm, nccl_comm);
 
         if (trial >= N_WARMUP)
             times.push_back(r.wall_ms);
@@ -107,6 +108,8 @@ int main(int argc, char** argv)
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
     CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
 
+    ncclComm_t nccl_comm = init_nccl(rank, world_size);
+
     Weights w = allocate_and_fill(p, rank, 42, compute_stream);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     compute_qkv(w, p, cublas_handle);
@@ -115,9 +118,9 @@ int main(int argc, char** argv)
     float* output = nullptr;
     CUDA_CHECK(cudaMalloc(&output, (size_t)p.S * p.d * sizeof(float)));
 
-    std::vector<double> meg_times = time_mode(0, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-    std::vector<double> sync_times = time_mode(1, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-    std::vector<double> overlap_times = time_mode(2, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
+    std::vector<double> meg_times = time_mode(0, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
+    std::vector<double> sync_times = time_mode(1, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
+    std::vector<double> overlap_times = time_mode(2, w, p, output, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
 
     if (rank == 0) {
         printf("S,D,B_M,mode,min_ms,max_ms,mean_ms,median_ms,std_ms\n");
@@ -129,6 +132,7 @@ int main(int argc, char** argv)
 
     free_weights(w);
     CUDA_CHECK(cudaFree(output));
+    NCCL_CHECK(ncclCommDestroy(nccl_comm));
     CUBLAS_CHECK(cublasDestroy(cublas_handle));
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     CUDA_CHECK(cudaStreamDestroy(proj_stream));

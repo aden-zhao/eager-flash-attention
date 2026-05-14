@@ -3,6 +3,7 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <nccl.h>
 #include <cstdio>
 #include <cstdlib>
 #include "flash_attn.cuh"
@@ -32,6 +33,16 @@
         int e = (call);                                                 \
         if (e != MPI_SUCCESS) {                                         \
             fprintf(stderr, "MPI error %s:%d\n", __FILE__, __LINE__);  \
+            MPI_Abort(MPI_COMM_WORLD, 1);                               \
+        }                                                               \
+    } while (0)
+
+#define NCCL_CHECK(call)                                                \
+    do {                                                                \
+        ncclResult_t r = (call);                                        \
+        if (r != ncclSuccess) {                                         \
+            fprintf(stderr, "NCCL error %s:%d: %s\n",                  \
+                    __FILE__, __LINE__, ncclGetErrorString(r));         \
             MPI_Abort(MPI_COMM_WORLD, 1);                               \
         }                                                               \
     } while (0)

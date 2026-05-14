@@ -11,7 +11,8 @@ struct Weights {
 };
 
 void init_mpi(int* argc, char*** argv, int& rank, int& world_size);
-int  init_cuda(int rank);
+int init_cuda(int rank);
+ncclComm_t init_nccl(int rank, int world_size);
 
 AttnParams make_params(int S, int d, int H, int B_M, int B_N, int world_size);
 

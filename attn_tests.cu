@@ -39,6 +39,8 @@ int main(int argc, char** argv)
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
     CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
 
+    ncclComm_t nccl_comm = init_nccl(rank, world_size);
+
     const TestCase cases[] = {
         {  128,  64, 4, 16, 16 },
         {  256, 128, 8, 32, 32 },
@@ -83,9 +85,9 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaMalloc(&out_overlap, out_bytes));
             CUDA_CHECK(cudaMalloc(&out_base, out_bytes));
 
-            run_megatron(w.Q, w.K, w.V, w.W_O, out_meg, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-            run_sync(w.Q, w.K, w.V, w.W_O, out_sync, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
-            run_overlap(w.Q, w.K, w.V, w.W_O, out_overlap, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD);
+            run_megatron(w.Q, w.K, w.V, w.W_O, out_meg, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
+            run_sync(w.Q, w.K, w.V, w.W_O, out_sync, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
+            run_overlap(w.Q, w.K, w.V, w.W_O, out_overlap, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
 
             {
                 float* O_attn = nullptr;
@@ -145,6 +147,7 @@ int main(int argc, char** argv)
     if (rank == 0)
         printf("\n%d passed, %d failed\n", total_pass, total_fail);
 
+    NCCL_CHECK(ncclCommDestroy(nccl_comm));
     CUBLAS_CHECK(cublasDestroy(cublas_handle));
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     CUDA_CHECK(cudaStreamDestroy(proj_stream));

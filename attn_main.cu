@@ -101,6 +101,16 @@ void compute_qkv(const Weights& w, const AttnParams& p, cublasHandle_t handle)
     }
 }
 
+ncclComm_t init_nccl(int rank, int world_size)
+{
+    ncclUniqueId id;
+    if (rank == 0) NCCL_CHECK(ncclGetUniqueId(&id));
+    MPI_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclComm_t comm;
+    NCCL_CHECK(ncclCommInitRank(&comm, world_size, id, rank));
+    return comm;
+}
+
 void free_weights(const Weights& w)
 {
     CUDA_CHECK(cudaFree(w.X));
