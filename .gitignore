@@ -1,3 +1,6 @@
+build/
+prof/
+logs/
 temp_trash/
-
 aden_bs/
+.DS_Store

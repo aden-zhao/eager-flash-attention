@@ -16,6 +16,7 @@ void baseline_attention(
     int H_local,
     int S,
     int d_h,
+    int causal,
     cudaStream_t stream,
     cublasHandle_t handle
 );

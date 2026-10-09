@@ -1,190 +1,292 @@
 #include "run_drivers.cuh"
-#include "flash_attn.cuh"
+
+#include <cuda.h>
 
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
-RunResult run_megatron(
-    const float* Q,
-    const float* K,
-    const float* V,
-    const float* W_O,
-    float* output,
-    const AttnParams& p,
-    cudaStream_t compute_stream,
-    cudaStream_t proj_stream,
-    cublasHandle_t cublas_handle,
-    MPI_Comm comm,
-    ncclComm_t nccl_comm
-)
+static const char* MODE_NAMES[MODE_COUNT] = {
+    "attn", "attn_tiled", "megatron", "sync", "overlap", "stream", "comm"
+};
+
+const char* mode_name(int mode)
 {
-    float* O_tiles = nullptr;
+    return (mode >= 0 && mode < MODE_COUNT) ? MODE_NAMES[mode] : "?";
+}
+
+int parse_mode(const char* s)
+{
+    for (int i = 0; i < MODE_COUNT; i++)
+        if (std::strcmp(s, MODE_NAMES[i]) == 0) return i;
+    return -1;
+}
+
+// AllReduce on communicator slot `slot` (tile t uses t % ncomm).
+static void allreduce(const RunCtx& c, int slot, const float* send, float* recv, size_t n, const AttnParams& p)
+{
+    if (p.skip_comm) return;
+    NCCL_CHECK(ncclAllReduce(send, recv, n, ncclFloat, ncclSum, c.nccls[slot], c.comm_streams[slot]));
+}
+
+static void sync_comm_streams(const RunCtx& c)
+{
+    for (int i = 0; i < c.ncomm; i++)
+        CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[i]));
+}
+
+static double finish_timing(double t0, MPI_Comm comm)
+{
+    double local = (MPI_Wtime() - t0) * 1e3;
+    double global = local;
+    MPI_CHECK(MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, comm));
+    return global;
+}
+
+// ---------------------------------------------------------------------------
+
+static RunResult run_attn_only(const Weights& w, const AttnParams& p, const RunCtx& c, bool tiled)
+{
+    void* O_all = nullptr;
+    CUDA_CHECK(cudaMalloc(&O_all, (size_t)p.S * p.d_local * o_elem_bytes(p)));
+    AttnWorkspace ws = alloc_workspace(p, tiled ? p.tile : p.S);
+
+    MPI_CHECK(MPI_Barrier(c.comm));
+    double t0 = MPI_Wtime();
+
+    if (tiled) {
+        for (int t = 0; t < p.num_tiles; t++)
+            launch_attention(w, static_cast<char*>(O_all) + (size_t)t * p.tile * p.d_local * o_elem_bytes(p), ws, t * p.tile, p.tile, p, c.compute_stream);
+    } else {
+        launch_attention(w, O_all, ws, 0, p.S, p, c.compute_stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(c.compute_stream));
+
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    free_workspace(ws);
+    CUDA_CHECK(cudaFree(O_all));
+    return r;
+}
+
+static RunResult run_megatron(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+{
+    void* O_all = nullptr;
     float* send_buf = nullptr;
-    cudaStream_t comm_stream;
-    CUDA_CHECK(cudaMalloc(&O_tiles, (size_t)p.S * p.d_local * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * o_elem_bytes(p)));
     CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
-    CUDA_CHECK(cudaStreamCreate(&comm_stream));
+    AttnWorkspace ws = alloc_workspace(p, p.S);
+    cudaEvent_t attn_done, proj_done;
+    CUDA_CHECK(cudaEventCreateWithFlags(&attn_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&proj_done, cudaEventDisableTiming));
 
-    MPI_CHECK(MPI_Barrier(comm));
+    MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
 
-    for (int tile = 0; tile < p.num_tiles; tile++)
-        flash_attn_forward_tile(Q, K, V,
-                                O_tiles + (size_t)tile * p.B_M * p.d_local,
-                                tile, p.flash, compute_stream);
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    launch_attention(w, O_all, ws, 0, p.S, p, c.compute_stream);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(attn_done, c.compute_stream));
 
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
-    CUBLAS_CHECK(cublasSgemm(cublas_handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        p.d, p.S, p.d_local,
-        &alpha, W_O, p.d,
-                O_tiles, p.d_local,
-        &beta, send_buf, p.d));
-    CUDA_CHECK(cudaStreamSynchronize(proj_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(c.proj_stream, attn_done, 0));
+    project(c, w, O_all, send_buf, p.S, p);
+    CUDA_CHECK(cudaEventRecord(proj_done, c.proj_stream));
 
-    NCCL_CHECK(ncclAllReduce(send_buf, output,
-                             (size_t)p.S * p.d, ncclFloat, ncclSum, nccl_comm, comm_stream));
-    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(c.comm_streams[0], proj_done, 0));
+    allreduce(c, 0, send_buf, output, (size_t)p.S * p.d, p);
+    CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
 
-    double t1 = MPI_Wtime();
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
 
-    CUDA_CHECK(cudaFree(O_tiles));
+    CUDA_CHECK(cudaEventDestroy(attn_done));
+    CUDA_CHECK(cudaEventDestroy(proj_done));
+    free_workspace(ws);
+    CUDA_CHECK(cudaFree(O_all));
     CUDA_CHECK(cudaFree(send_buf));
-    CUDA_CHECK(cudaStreamDestroy(comm_stream));
-
-    RunResult result;
-    result.wall_ms = (t1 - t0) * 1e3;
-    return result;
+    return r;
 }
 
-RunResult run_sync(
-    const float* Q,
-    const float* K,
-    const float* V,
-    const float* W_O,
-    float* output,
-    const AttnParams& p,
-    cudaStream_t compute_stream,
-    cudaStream_t proj_stream,
-    cublasHandle_t cublas_handle,
-    MPI_Comm comm,
-    ncclComm_t nccl_comm
-)
+static RunResult run_sync(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
-    float* O_tile = nullptr;
+    void* O_tile = nullptr;
     float* send_buf = nullptr;
-    cudaStream_t comm_stream;
-    CUDA_CHECK(cudaMalloc(&O_tile, (size_t)p.B_M * p.d_local * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.B_M * p.d * sizeof(float)));
-    CUDA_CHECK(cudaStreamCreate(&comm_stream));
+    CUDA_CHECK(cudaMalloc(&O_tile,   (size_t)p.tile * p.d_local * o_elem_bytes(p)));
+    CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.tile * p.d * sizeof(float)));
+    AttnWorkspace ws = alloc_workspace(p, p.tile);
 
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
-
-    MPI_CHECK(MPI_Barrier(comm));
+    MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
 
-    for (int tile = 0; tile < p.num_tiles; tile++) {
-        flash_attn_forward_tile(Q, K, V, O_tile, tile, p.flash, compute_stream);
-        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    for (int t = 0; t < p.num_tiles; t++) {
+        launch_attention(w, O_tile, ws, t * p.tile, p.tile, p, c.compute_stream);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(c.compute_stream));
 
-        CUBLAS_CHECK(cublasSgemm(cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            p.d, p.B_M, p.d_local,
-            &alpha, W_O, p.d,
-                    O_tile, p.d_local,
-            &beta, send_buf, p.d));
-        CUDA_CHECK(cudaStreamSynchronize(proj_stream));
+        project(c, w, O_tile, send_buf, p.tile, p);
+        CUDA_CHECK(cudaStreamSynchronize(c.proj_stream));
 
-        NCCL_CHECK(ncclAllReduce(send_buf,
-                                 output + (size_t)tile * p.B_M * p.d,
-                                 p.B_M * p.d, ncclFloat, ncclSum, nccl_comm, comm_stream));
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+        allreduce(c, 0, send_buf, output + (size_t)t * p.tile * p.d, (size_t)p.tile * p.d, p);
+        CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
     }
 
-    double t1 = MPI_Wtime();
-
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    free_workspace(ws);
     CUDA_CHECK(cudaFree(O_tile));
     CUDA_CHECK(cudaFree(send_buf));
-    CUDA_CHECK(cudaStreamDestroy(comm_stream));
-
-    RunResult result;
-    result.wall_ms = (t1 - t0) * 1e3;
-    return result;
+    return r;
 }
 
-RunResult run_overlap(
-    const float* Q,
-    const float* K,
-    const float* V,
-    const float* W_O,
-    float* output,
-    const AttnParams& p,
-    cudaStream_t compute_stream,
-    cudaStream_t proj_stream,
-    cublasHandle_t cublas_handle,
-    MPI_Comm comm,
-    ncclComm_t nccl_comm
-)
+// Fully asynchronous pipeline. The host enqueues every tile up front; the
+// three streams are ordered only by events:
+//   compute:  attn(t)  [waits proj_done(t - nbuf): O_tile[b] free]
+//   proj:     gemm(t)  [waits attn_done(t), comm_done(t - nbuf): send_buf[b] free]
+//   comm[t % ncomm]: allreduce(t) [waits proj_done(t)]
+static RunResult run_overlap(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
-    float* O_tile = nullptr;
-    float* send_buf[2] = {nullptr, nullptr};
-    cudaStream_t comm_stream;
-    CUDA_CHECK(cudaMalloc(&O_tile, (size_t)p.B_M * p.d_local * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&send_buf[0], (size_t)p.B_M * p.d * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&send_buf[1], (size_t)p.B_M * p.d * sizeof(float)));
-    CUDA_CHECK(cudaStreamCreate(&comm_stream));
+    const int nbuf = p.nbuf;
+    std::vector<void*> O_tile(nbuf);
+    std::vector<float*> send_buf(nbuf);
+    std::vector<cudaEvent_t> attn_done(nbuf), proj_done(nbuf), comm_done(nbuf);
+    for (int b = 0; b < nbuf; b++) {
+        CUDA_CHECK(cudaMalloc(&O_tile[b],   (size_t)p.tile * p.d_local * o_elem_bytes(p)));
+        CUDA_CHECK(cudaMalloc(&send_buf[b], (size_t)p.tile * p.d * sizeof(float)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&attn_done[b], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&proj_done[b], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&comm_done[b], cudaEventDisableTiming));
+    }
+    AttnWorkspace ws = alloc_workspace(p, p.tile);   // shared: attention + combine are stream-ordered
 
-    // comm_done[b] signals when the allreduce using send_buf[b] is complete,
-    // allowing send_buf[b] to be reused by the projection 2 tiles later.
-    cudaEvent_t comm_done[2];
-    CUDA_CHECK(cudaEventCreateWithFlags(&comm_done[0], cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&comm_done[1], cudaEventDisableTiming));
-
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
-
-    MPI_CHECK(MPI_Barrier(comm));
+    MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
 
-    for (int tile = 0; tile < p.num_tiles; tile++) {
-        int buf = tile % 2;
+    for (int t = 0; t < p.num_tiles; t++) {
+        const int b = t % nbuf;
 
-        if (tile >= 2)
-            CUDA_CHECK(cudaStreamWaitEvent(compute_stream, comm_done[buf]));
+        if (t >= nbuf)
+            CUDA_CHECK(cudaStreamWaitEvent(c.compute_stream, proj_done[b], 0));
+        launch_attention(w, O_tile[b], ws, t * p.tile, p.tile, p, c.compute_stream);
+        CUDA_CHECK(cudaEventRecord(attn_done[b], c.compute_stream));
 
-        flash_attn_forward_tile(Q, K, V, O_tile, tile, p.flash, compute_stream);
-        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(c.proj_stream, attn_done[b], 0));
+        if (t >= nbuf)
+            CUDA_CHECK(cudaStreamWaitEvent(c.proj_stream, comm_done[b], 0));
+        project(c, w, O_tile[b], send_buf[b], p.tile, p);
+        CUDA_CHECK(cudaEventRecord(proj_done[b], c.proj_stream));
 
-        CUBLAS_CHECK(cublasSgemm(cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            p.d, p.B_M, p.d_local,
-            &alpha, W_O, p.d,
-                    O_tile, p.d_local,
-            &beta, send_buf[buf], p.d));
-        CUDA_CHECK(cudaStreamSynchronize(proj_stream));
-
-        // Enqueue allreduce on comm_stream — returns immediately.
-        // Next tile's attention launches on compute_stream in parallel.
-        NCCL_CHECK(ncclAllReduce(send_buf[buf],
-                                 output + (size_t)tile * p.B_M * p.d,
-                                 p.B_M * p.d, ncclFloat, ncclSum, nccl_comm, comm_stream));
-        CUDA_CHECK(cudaEventRecord(comm_done[buf], comm_stream));
+        const int slot = t % c.ncomm;
+        CUDA_CHECK(cudaStreamWaitEvent(c.comm_streams[slot], proj_done[b], 0));
+        allreduce(c, slot, send_buf[b], output + (size_t)t * p.tile * p.d, (size_t)p.tile * p.d, p);
+        CUDA_CHECK(cudaEventRecord(comm_done[b], c.comm_streams[slot]));
     }
+    CUDA_CHECK(cudaGetLastError());
+    sync_comm_streams(c);
 
-    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
 
-    double t1 = MPI_Wtime();
+    for (int b = 0; b < nbuf; b++) {
+        CUDA_CHECK(cudaEventDestroy(attn_done[b]));
+        CUDA_CHECK(cudaEventDestroy(proj_done[b]));
+        CUDA_CHECK(cudaEventDestroy(comm_done[b]));
+        CUDA_CHECK(cudaFree(O_tile[b]));
+        CUDA_CHECK(cudaFree(send_buf[b]));
+    }
+    free_workspace(ws);
+    return r;
+}
 
-    CUDA_CHECK(cudaEventDestroy(comm_done[0]));
-    CUDA_CHECK(cudaEventDestroy(comm_done[1]));
-    CUDA_CHECK(cudaFree(O_tile));
-    CUDA_CHECK(cudaFree(send_buf[0]));
-    CUDA_CHECK(cudaFree(send_buf[1]));
-    CUDA_CHECK(cudaStreamDestroy(comm_stream));
+// Single attention launch over all S; the kernel bumps tile_counters[t] once
+// per finished block. The projection stream blocks on each counter with a
+// stream memory op (no host involvement, no SM spinning), so projection and
+// AllReduce of tile t start as soon as its rows exist while later tiles are
+// still computing at full-GPU efficiency.
+static RunResult run_stream(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+{
+    void* O_all = nullptr;
+    float* send_buf = nullptr;
+    int* counters = nullptr;
+    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * o_elem_bytes(p)));
+    CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&counters, (size_t)p.num_tiles * sizeof(int)));
+    AttnWorkspace ws = alloc_workspace(p, p.S);
+    const int target = blocks_per_tile(p);
 
-    RunResult result;
-    result.wall_ms = (t1 - t0) * 1e3;
-    return result;
+    cudaEvent_t reset_done;
+    std::vector<cudaEvent_t> proj_done(p.num_tiles);
+    CUDA_CHECK(cudaEventCreateWithFlags(&reset_done, cudaEventDisableTiming));
+    for (int t = 0; t < p.num_tiles; t++)
+        CUDA_CHECK(cudaEventCreateWithFlags(&proj_done[t], cudaEventDisableTiming));
+
+    MPI_CHECK(MPI_Barrier(c.comm));
+    double t0 = MPI_Wtime();
+
+    CUDA_CHECK(cudaMemsetAsync(counters, 0, (size_t)p.num_tiles * sizeof(int), c.compute_stream));
+    CUDA_CHECK(cudaEventRecord(reset_done, c.compute_stream));
+    launch_attention_raw(w, O_all, ws, 0, p.S, p, c.compute_stream, counters, p.tile);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaStreamWaitEvent(c.proj_stream, reset_done, 0));   // never observe a stale counter
+    for (int t = 0; t < p.num_tiles; t++) {
+        CU_CHECK(cuStreamWaitValue32((CUstream)c.proj_stream,
+                                     (CUdeviceptr)(counters + t), (cuuint32_t)target,
+                                     CU_STREAM_WAIT_VALUE_GEQ));
+        void* O_t = static_cast<char*>(O_all) + (size_t)t * p.tile * p.d_local * o_elem_bytes(p);
+        launch_combine(ws, O_t, t * p.tile, p.tile, p, c.proj_stream);
+        project(c, w, O_t, send_buf + (size_t)t * p.tile * p.d, p.tile, p);
+        CUDA_CHECK(cudaEventRecord(proj_done[t], c.proj_stream));
+
+        const int slot = t % c.ncomm;
+        CUDA_CHECK(cudaStreamWaitEvent(c.comm_streams[slot], proj_done[t], 0));
+        allreduce(c, slot, send_buf + (size_t)t * p.tile * p.d, output + (size_t)t * p.tile * p.d,
+                  (size_t)p.tile * p.d, p);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(c.compute_stream));
+    CUDA_CHECK(cudaStreamSynchronize(c.proj_stream));
+    sync_comm_streams(c);
+
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+
+    CUDA_CHECK(cudaEventDestroy(reset_done));
+    for (int t = 0; t < p.num_tiles; t++)
+        CUDA_CHECK(cudaEventDestroy(proj_done[t]));
+    free_workspace(ws);
+    CUDA_CHECK(cudaFree(O_all));
+    CUDA_CHECK(cudaFree(send_buf));
+    CUDA_CHECK(cudaFree(counters));
+    return r;
+}
+
+// Communication only: the per-tile AllReduces of a full pass, back to back on
+// communicator 0, nothing else in flight. Sweeping --tile gives t_allreduce(bytes).
+static RunResult run_comm_only(float* output, const AttnParams& p, const RunCtx& c)
+{
+    float* send_buf = nullptr;
+    CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
+    CUDA_CHECK(cudaMemset(send_buf, 0, (size_t)p.S * p.d * sizeof(float)));
+
+    MPI_CHECK(MPI_Barrier(c.comm));
+    double t0 = MPI_Wtime();
+    for (int t = 0; t < p.num_tiles; t++)
+        allreduce(c, 0, send_buf + (size_t)t * p.tile * p.d, output + (size_t)t * p.tile * p.d,
+                  (size_t)p.tile * p.d, p);
+    CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
+    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+
+    CUDA_CHECK(cudaFree(send_buf));
+    return r;
+}
+
+RunResult run_mode(int mode, const Weights& w, float* output,
+                   const AttnParams& p, const RunCtx& c)
+{
+    switch (mode) {
+        case MODE_ATTN:       return run_attn_only(w, p, c, false);
+        case MODE_ATTN_TILED: return run_attn_only(w, p, c, true);
+        case MODE_MEGATRON:   return run_megatron(w, output, p, c);
+        case MODE_SYNC:       return run_sync(w, output, p, c);
+        case MODE_OVERLAP:    return run_overlap(w, output, p, c);
+        case MODE_STREAM:     return run_stream(w, output, p, c);
+        case MODE_COMM:       return run_comm_only(output, p, c);
+    }
+    fprintf(stderr, "unknown mode %d\n", mode);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+    return RunResult{};
 }

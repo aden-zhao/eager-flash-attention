@@ -8,35 +8,42 @@ size_t flash_attn_smem_bytes(const FlashAttnParams& p)
     return 2 * p.B_N * p.d_h * sizeof(float);
 }
 
-void flash_attn_forward_tile(
+void flash_attn_forward(
     const float* Q, const float* K, const float* V,
-    float* O_tile, int tile_idx,
-    const FlashAttnParams& p, cudaStream_t stream
+    float* O, int q_start, int q_rows,
+    const FlashAttnParams& p, cudaStream_t stream,
+    int* tile_counters, int tile_rows
 )
 {
-    flash_attn_kernel<<<p.H_local, p.B_M << 5, flash_attn_smem_bytes(p), stream>>>(
-        Q, K, V, O_tile, tile_idx, p);
+    dim3 grid(p.H_local, q_rows / p.B_M);
+    flash_attn_kernel<<<grid, p.B_M << 5, flash_attn_smem_bytes(p), stream>>>(
+        Q, K, V, O, q_start, p, tile_counters, tile_rows);
 }
 
 __global__ void flash_attn_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
-    float* __restrict__ O_tile,
-    int tile_idx,
-    FlashAttnParams p
+    float* __restrict__ O,
+    int q_start,
+    FlashAttnParams p,
+    int* __restrict__ tile_counters,
+    int tile_rows
 )
 {
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int cols_per = p.d_h / 32;
     int head = blockIdx.x;
+    int block_row0 = blockIdx.y * p.B_M;
+    int local_row = block_row0 + warp_id;   // row within this launch
+    int q_row = q_start + local_row;
 
     int scores_per = p.B_N / 32;
     int kv_elems = p.B_N * p.d_h;
-    int head_off = head * p.S * p.d_h;
+    size_t head_off = (size_t)head * p.S * p.d_h;
 
-    const float* Q_lane = Q + head_off + (tile_idx * p.B_M + warp_id) * p.d_h + lane_id * cols_per;
+    const float* Q_lane = Q + head_off + (size_t)q_row * p.d_h + lane_id * cols_per;
 
     extern __shared__ float smem[];
     float* K_smem = smem;
@@ -49,8 +56,10 @@ __global__ void flash_attn_kernel(
 
     for (int j = 0; j < p.S; j += p.B_N)
     {
-        const float* K_base = K + head_off + j * p.d_h;
-        const float* V_base = V + head_off + j * p.d_h;
+        // Block-uniform early exit: no row of this block needs keys past the block's last row.
+        if (p.causal && j > q_start + block_row0 + p.B_M - 1) break;
+        const float* K_base = K + head_off + (size_t)j * p.d_h;
+        const float* V_base = V + head_off + (size_t)j * p.d_h;
 
         for (int e = threadIdx.x; e < kv_elems; e += blockDim.x) {
             K_smem[e] = K_base[e];
@@ -69,6 +78,8 @@ __global__ void flash_attn_kernel(
 
             for (int offset = 16; offset >= 1; offset >>= 1)
                 partial += __shfl_xor_sync(0xffffffff, partial, offset);
+
+            if (p.causal && j + q > q_row) partial = -INFINITY;
 
             if (lane_id == q % 32)
                 scores[q / 32] = partial;
@@ -107,21 +118,29 @@ __global__ void flash_attn_kernel(
         __syncthreads();
     }
 
-    float* O_lane = O_tile + warp_id * p.H_local * p.d_h + head * p.d_h + lane_id * cols_per;
+    float* O_lane = O + (size_t)local_row * p.H_local * p.d_h + head * p.d_h + lane_id * cols_per;
     for (int f = 0; f < cols_per; f++)
         O_lane[f] = O_acc[f] / ell;
+
+    if (tile_counters != nullptr) {
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0)
+            atomicAdd(tile_counters + block_row0 / tile_rows, 1);
+    }
 }
 
-bool flash_attn_check_params(const FlashAttnParams& p, int cuda_device)
+const char* flash_attn_check_params(const FlashAttnParams& p, int q_rows, int cuda_device)
 {
-    if ((p.B_M << 5) > 1024) return false;
+    if (p.B_M < 1 || (p.B_M << 5) > 1024) return "v1: B_M must be in [1, 32]";
+    if (p.d_h % 32 != 0) return "v1: d_h must be a multiple of 32";
+    if (p.d_h > MAX_D_H) return "v1: d_h too large";
+    if (p.B_N % 32 != 0 || p.B_N > MAX_B_N) return "v1: B_N must be a multiple of 32 and <= 256";
+    if (p.S % p.B_N != 0) return "v1: S must be a multiple of B_N";
+    if (q_rows % p.B_M != 0) return "v1: tile must be a multiple of B_M";
 
     int maxSmem;
     cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlock, cuda_device);
-
-    if (flash_attn_smem_bytes(p) > (size_t)maxSmem) return false;
-    if (p.S % p.B_N != 0) return false;
-    if (p.S % p.B_M != 0) return false;
-
-    return true;
+    if (flash_attn_smem_bytes(p) > (size_t)maxSmem) return "v1: B_N * d_h too large for shared memory";
+    return nullptr;
 }

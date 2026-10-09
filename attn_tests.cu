@@ -1,3 +1,5 @@
+// Correctness: every (kernel, mode) pair against a cuBLAS/naive-softmax
+// reference with the same weights, judged on relative error.
 #include "attn_main.cuh"
 #include "run_drivers.cuh"
 #include "baseline_attention.cuh"
@@ -7,150 +9,159 @@
 #include <cstdio>
 #include <vector>
 
-static float max_abs_diff(const float* a, const float* b, size_t n)
+struct Diff { float max_abs; float max_ref; };
+
+static Diff compare(const float* a, const float* ref, size_t n)
 {
-    float worst = 0.f;
-    for (size_t i = 0; i < n; i++)
-        worst = std::max(worst, std::fabsf(a[i] - b[i]));
-    return worst;
+    Diff d = { 0.f, 0.f };
+    for (size_t i = 0; i < n; i++) {
+        d.max_abs = std::max(d.max_abs, std::fabs(a[i] - ref[i]));
+        d.max_ref = std::max(d.max_ref, std::fabs(ref[i]));
+    }
+    return d;
 }
 
-static bool check(const char* label, const float* a, const float* b, size_t n, float atol)
-{
-    float diff = max_abs_diff(a, b, n);
-    bool pass = diff <= atol;
-    printf("  %-30s  max_diff=%.2e  %s\n", label, diff, pass ? "PASS" : "FAIL");
-    return pass;
-}
+struct TestCase { int S, d, H, tile, B_M, B_N, nbuf, split, causal; };
 
-struct TestCase { int S, d, H, B_M, B_N; };
+// Reference: per-head materialized softmax(QK^T)V (fp32), projection, MPI allreduce.
+static void reference(const Weights& w, const AttnParams& p, const RunCtx& c, float* out_base)
+{
+    const size_t out_bytes = (size_t)p.S * p.d * sizeof(float);
+    float* O_attn = nullptr;
+    float* P_local = nullptr;
+    float* workspace = nullptr;
+    CUDA_CHECK(cudaMalloc(&O_attn, (size_t)p.S * p.d_local * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&P_local, out_bytes));
+    CUDA_CHECK(cudaMalloc(&workspace, baseline_attention_workspace_bytes(p.S)));
+
+    baseline_attention(w.Q, w.K, w.V, O_attn, workspace,
+                       p.H_local, p.S, p.d_h, p.causal, c.compute_stream, c.cublas);
+    CUDA_CHECK(cudaStreamSynchronize(c.compute_stream));
+
+    const float alpha = 1.f, beta = 0.f;
+    CUBLAS_CHECK(cublasSetStream(c.cublas, c.proj_stream));
+    CUBLAS_CHECK(cublasSgemm(c.cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        p.d, p.S, p.d_local,
+        &alpha, w.W_O, p.d,
+                O_attn, p.d_local,
+        &beta, P_local, p.d));
+    CUDA_CHECK(cudaStreamSynchronize(c.proj_stream));
+
+    // Reference reduction: one plain NCCL AllReduce on communicator 0, fully
+    // synchronized. (A large MPI_Allreduce here, on device or host buffers,
+    // hangs across nodes on Perlmutter once NCCL's libfabric plugin is loaded.)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    NCCL_CHECK(ncclAllReduce(P_local, out_base, (size_t)p.S * p.d, ncclFloat, ncclSum,
+                             c.nccls[0], c.comm_streams[0]));
+    CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
+
+    CUDA_CHECK(cudaFree(O_attn));
+    CUDA_CHECK(cudaFree(P_local));
+    CUDA_CHECK(cudaFree(workspace));
+}
 
 int main(int argc, char** argv)
 {
     int rank, world_size;
     init_mpi(&argc, &argv, rank, world_size);
     int device = init_cuda(rank);
+    RunCtx ctx = make_ctx(MPI_COMM_WORLD, rank, world_size, /*ncomm=*/3);
 
-    cudaStream_t compute_stream, proj_stream;
-    CUDA_CHECK(cudaStreamCreate(&compute_stream));
-    CUDA_CHECK(cudaStreamCreate(&proj_stream));
-
-    cublasHandle_t cublas_handle;
-    CUBLAS_CHECK(cublasCreate(&cublas_handle));
-    CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
-
-    ncclComm_t nccl_comm = init_nccl(rank, world_size);
-
+    //                 S     d    H  tile B_M B_N nbuf split causal
     const TestCase cases[] = {
-        {  128,  64, 4, 16, 16 },
-        {  256, 128, 8, 32, 32 },
-        {  512, 128, 8, 32, 64 },
-        {  512, 256, 8, 16, 32 },
-        { 1024, 256, 8, 32, 64 },
+        {  128,   64,  4,   64, 16, 32, 2, 1, 0 },   // d_h=16: tc only
+        {  256,  128,  4,   64, 32, 32, 2, 1, 0 },   // d_h=32
+        {  512,  256,  8,  128, 32, 64, 2, 1, 0 },   // d_h=32
+        { 1024,  512,  8,  256, 16, 64, 2, 1, 0 },   // d_h=64
+        { 2048, 1024,  8,  512, 32, 64, 3, 1, 0 },   // d_h=128
+        { 1024, 1024,  8,   64, 32, 64, 3, 1, 0 },   // d_h=128, 16 tiles deep pipeline
+        { 1024,  512,  8,  256, 16, 64, 2, 4, 0 },   // split-KV (tc only)
+        { 2048,  512,  8,  128, 16, 64, 2, 8, 0 },   // split-KV, 16 tiles
+        {  512,  256,  8,   64, 32, 64, 2, 2, 0 },   // split-KV, d_h=32
+        { 1024,  512,  8,  256, 16, 64, 2, 1, 1 },   // causal
+        { 2048,  512,  8,  128, 32, 64, 2, 8, 1 },   // causal + split-KV (some blocks idle)
+        {  512,  256,  8,   64, 32, 32, 2, 1, 1 },   // causal, B_N=32 (v1 partial chunks)
+        { 2048, 1024,  8,  512, 32, 64, 3, 4, 1 },   // causal, d_h=128
     };
     const int seeds[] = { 42, 123, 777 };
+    const int kernels[] = { KERNEL_V1, KERNEL_TC };
+    // (kernel, projection) variants: v1/fp32, tc/fp32, tc/bf16
+    struct Variant { int kernel, proj; };
+    const Variant variants[] = { { KERNEL_V1, PROJ_FP32 }, { KERNEL_TC, PROJ_FP32 }, { KERNEL_TC, PROJ_BF16 } };
+    (void)kernels;
+    const int modes[] = { MODE_MEGATRON, MODE_SYNC, MODE_OVERLAP, MODE_STREAM };
 
-    int total_pass = 0, total_fail = 0;
+    int total_pass = 0, total_fail = 0, total_skip = 0;
 
     for (const auto& tc : cases) {
-        AttnParams p = make_params(tc.S, tc.d, tc.H, tc.B_M, tc.B_N, world_size);
-
-        if (tc.H % world_size != 0) {
-            if (rank == 0)
-                printf("SKIP S=%d H=%d: H not divisible by R=%d\n", tc.S, tc.H, world_size);
-            continue;
-        }
-
-        if (!flash_attn_check_params(p.flash, device)) {
-            if (rank == 0)
-                printf("SKIP S=%d d=%d H=%d B_M=%d: invalid params\n",
-                       tc.S, tc.d, tc.H, tc.B_M);
-            continue;
-        }
-
-        for (int seed : seeds) {
-            if (rank == 0)
-                printf("\nS=%d d=%d H=%d B_M=%d B_N=%d seed=%d R=%d\n",
-                       tc.S, tc.d, tc.H, tc.B_M, tc.B_N, seed, world_size);
-
-            Weights w = allocate_and_fill(p, rank, seed, compute_stream);
-            CUDA_CHECK(cudaStreamSynchronize(compute_stream));
-            compute_qkv(w, p, cublas_handle);
-            CUDA_CHECK(cudaStreamSynchronize(proj_stream));
-
-            const size_t out_bytes = (size_t)p.S * p.d * sizeof(float);
-            float *out_meg, *out_sync, *out_overlap, *out_base;
-            CUDA_CHECK(cudaMalloc(&out_meg, out_bytes));
-            CUDA_CHECK(cudaMalloc(&out_sync, out_bytes));
-            CUDA_CHECK(cudaMalloc(&out_overlap, out_bytes));
-            CUDA_CHECK(cudaMalloc(&out_base, out_bytes));
-
-            run_megatron(w.Q, w.K, w.V, w.W_O, out_meg, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
-            run_sync(w.Q, w.K, w.V, w.W_O, out_sync, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
-            run_overlap(w.Q, w.K, w.V, w.W_O, out_overlap, p, compute_stream, proj_stream, cublas_handle, MPI_COMM_WORLD, nccl_comm);
-
-            {
-                float* O_attn = nullptr;
-                float* P_local = nullptr;
-                float* workspace = nullptr;
-                CUDA_CHECK(cudaMalloc(&O_attn, (size_t)p.S * p.d_local * sizeof(float)));
-                CUDA_CHECK(cudaMalloc(&P_local, out_bytes));
-                CUDA_CHECK(cudaMalloc(&workspace, baseline_attention_workspace_bytes(p.S)));
-
-                baseline_attention(w.Q, w.K, w.V, O_attn, workspace,
-                                   p.H_local, p.S, p.d_h, compute_stream, cublas_handle);
-                CUDA_CHECK(cudaStreamSynchronize(compute_stream));
-
-                const float alpha = 1.f, beta = 0.f;
-                CUBLAS_CHECK(cublasSetStream(cublas_handle, proj_stream));
-                CUBLAS_CHECK(cublasSgemm(cublas_handle,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    p.d, p.S, p.d_local,
-                    &alpha, w.W_O, p.d,
-                            O_attn, p.d_local,
-                    &beta, P_local, p.d));
-                CUDA_CHECK(cudaStreamSynchronize(proj_stream));
-
-                MPI_CHECK(MPI_Allreduce(P_local, out_base,
-                                        p.S * p.d, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-
-                CUDA_CHECK(cudaFree(O_attn));
-                CUDA_CHECK(cudaFree(P_local));
-                CUDA_CHECK(cudaFree(workspace));
+        for (const Variant& v : variants) {
+            const int kernel = v.kernel;
+            AttnParams p = make_params(tc.S, tc.d, tc.H, tc.tile, tc.B_M, tc.B_N,
+                                       kernel, tc.nbuf, tc.split, tc.causal, v.proj, world_size);
+            const char* why = attn_check_params(p, device);
+            if (why) {
+                if (rank == 0)
+                    printf("SKIP  kernel=%s proj=%s S=%d d=%d H=%d tile=%d split=%d causal=%d: %s\n",
+                           kernel_name(kernel), proj_name(v.proj), tc.S, tc.d, tc.H, tc.tile, tc.split, tc.causal, why);
+                total_skip++;
+                continue;
             }
+            // fp16 inputs and fp16 P: ~1e-3 relative; bf16 output + bf16 GEMM: ~5e-3; fp32 fast-math: ~1e-5.
+            const float rtol = (v.proj == PROJ_BF16) ? 3e-2f : (kernel == KERNEL_TC) ? 2e-2f : 1e-3f;
 
-            if (rank == 0) {
+            for (int seed : seeds) {
+                if (rank == 0)
+                    printf("\nkernel=%s proj=%s S=%d d=%d H=%d d_h=%d tile=%d B_M=%d B_N=%d nbuf=%d split=%d causal=%d seed=%d R=%d\n",
+                           kernel_name(kernel), proj_name(v.proj), tc.S, tc.d, tc.H, p.d_h, tc.tile,
+                           tc.B_M, tc.B_N, tc.nbuf, tc.split, tc.causal, seed, world_size);
+
+                Weights w = allocate_and_fill(p, rank, seed, ctx.compute_stream);
+                CUDA_CHECK(cudaStreamSynchronize(ctx.compute_stream));
+                CUBLAS_CHECK(cublasSetStream(ctx.cublas, ctx.proj_stream));
+                compute_qkv(w, p, ctx.cublas);
+                CUDA_CHECK(cudaStreamSynchronize(ctx.proj_stream));
+
                 const size_t n = (size_t)p.S * p.d;
-                std::vector<float> h_meg(n), h_sync(n), h_overlap(n), h_base(n);
-                CUDA_CHECK(cudaMemcpy(h_meg.data(), out_meg, out_bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_sync.data(), out_sync, out_bytes, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_overlap.data(), out_overlap, out_bytes, cudaMemcpyDeviceToHost));
+                const size_t out_bytes = n * sizeof(float);
+                float *out_base, *out_mode;
+                CUDA_CHECK(cudaMalloc(&out_base, out_bytes));
+                CUDA_CHECK(cudaMalloc(&out_mode, out_bytes));
+
+                reference(w, p, ctx, out_base);
+                CUBLAS_CHECK(cublasSetStream(ctx.cublas, ctx.proj_stream));
+                std::vector<float> h_base(n), h_mode(n);
                 CUDA_CHECK(cudaMemcpy(h_base.data(), out_base, out_bytes, cudaMemcpyDeviceToHost));
 
-                const float atol = 1e-3f;
-                bool ok = true;
-                ok &= check("megatron vs baseline", h_meg.data(), h_base.data(), n, atol);
-                ok &= check("sync vs baseline", h_sync.data(), h_base.data(), n, atol);
-                ok &= check("overlap vs baseline", h_overlap.data(), h_base.data(), n, atol);
+                for (int mode : modes) {
+                    CUDA_CHECK(cudaMemset(out_mode, 0, out_bytes));
+                    run_mode(mode, w, out_mode, p, ctx);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(cudaMemcpy(h_mode.data(), out_mode, out_bytes, cudaMemcpyDeviceToHost));
 
-                if (ok) total_pass++; else total_fail++;
+                    Diff d = compare(h_mode.data(), h_base.data(), n);
+                    float rel = d.max_abs / std::max(d.max_ref, 1e-20f);
+                    int pass = (rel <= rtol) && std::isfinite(d.max_abs);
+                    int all_pass = pass;
+                    MPI_CHECK(MPI_Allreduce(&pass, &all_pass, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+                    if (rank == 0) {
+                        printf("  %-10s max_abs=%.3e  max_ref=%.3e  rel=%.3e  %s\n",
+                               mode_name(mode), d.max_abs, d.max_ref, rel, all_pass ? "PASS" : "FAIL");
+                        if (all_pass) total_pass++; else total_fail++;
+                    }
+                }
+
+                CUDA_CHECK(cudaFree(out_base));
+                CUDA_CHECK(cudaFree(out_mode));
+                free_weights(w);
             }
-
-            CUDA_CHECK(cudaFree(out_meg));
-            CUDA_CHECK(cudaFree(out_sync));
-            CUDA_CHECK(cudaFree(out_overlap));
-            CUDA_CHECK(cudaFree(out_base));
-            free_weights(w);
         }
     }
 
     if (rank == 0)
-        printf("\n%d passed, %d failed\n", total_pass, total_fail);
+        printf("\n%d passed, %d failed, %d skipped configurations\n", total_pass, total_fail, total_skip);
 
-    NCCL_CHECK(ncclCommDestroy(nccl_comm));
-    CUBLAS_CHECK(cublasDestroy(cublas_handle));
-    CUDA_CHECK(cudaStreamDestroy(compute_stream));
-    CUDA_CHECK(cudaStreamDestroy(proj_stream));
+    destroy_ctx(ctx);
     MPI_CHECK(MPI_Finalize());
     return total_fail > 0 ? 1 : 0;
 }

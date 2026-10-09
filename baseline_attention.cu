@@ -26,13 +26,15 @@
 
 // One block per row. Shared memory holds per-thread partial values.
 // Computes softmax in-place over ncols elements.
-static __global__ void softmax_rows(float* A, int ncols)
+static __global__ void softmax_rows(float* A, int ncols, int causal)
 {
     extern __shared__ float smem[];
-    float* row = A + blockIdx.x * ncols;
+    const int r = blockIdx.x;
+    float* row = A + (size_t)r * ncols;
+    const int valid = causal ? (r + 1) : ncols;   // keys 0..r only when causal
 
     float local_max = -INFINITY;
-    for (int j = threadIdx.x; j < ncols; j += blockDim.x)
+    for (int j = threadIdx.x; j < valid; j += blockDim.x)
         local_max = fmaxf(local_max, row[j]);
     smem[threadIdx.x] = local_max;
     __syncthreads();
@@ -45,7 +47,7 @@ static __global__ void softmax_rows(float* A, int ncols)
     __syncthreads();
 
     float local_sum = 0.f;
-    for (int j = threadIdx.x; j < ncols; j += blockDim.x)
+    for (int j = threadIdx.x; j < valid; j += blockDim.x)
         local_sum += expf(row[j] - row_max);
     smem[threadIdx.x] = local_sum;
     __syncthreads();
@@ -58,7 +60,7 @@ static __global__ void softmax_rows(float* A, int ncols)
     __syncthreads();
 
     for (int j = threadIdx.x; j < ncols; j += blockDim.x)
-        row[j] = expf(row[j] - row_max) / row_sum;
+        row[j] = (j < valid) ? expf(row[j] - row_max) / row_sum : 0.f;
 }
 
 // Copy head h's result O_h[S, d_h] into O[S, d_local] at column offset h*d_h.
@@ -86,6 +88,7 @@ void baseline_attention(
     int H_local,
     int S,
     int d_h,
+    int causal,
     cudaStream_t stream,
     cublasHandle_t handle)
 {
@@ -116,7 +119,7 @@ void baseline_attention(
             workspace, S));
 
         // softmax each row of scores in-place
-        softmax_rows<<<S, 256, 256 * sizeof(float), stream>>>(workspace, S);
+        softmax_rows<<<S, 256, 256 * sizeof(float), stream>>>(workspace, S, causal);
         CUDA_CHECK(cudaGetLastError());
 
         // O_h[S, d_h] = scores[S, S] * V_h[S, d_h]
