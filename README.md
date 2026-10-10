@@ -18,6 +18,29 @@ FlashAttention computes the output one block of query rows at a time, and each b
                           [AllReduce 0][AllReduce 1]...
 ```
 
+The pass then costs roughly `max(attention, communication)` instead of `attention + communication`.
+
+## Headline result
+
+Measured 2026-10-10 on NERSC Perlmutter (A100-SXM4-40GB), `H=16`, `d_h=64`, heads split across GPUs. Wall-clock ms for attention + output projection + AllReduce, max over ranks, median of 5 trials. All rows come from one allocation (`results/core_*.csv`, rendered by `python3 bench_tables.py --headline results/core_*.csv`).
+
+| setup | S | mask | attention only | one-shot (megatron) | stream (best tile) | speedup |
+|---|---|---|---|---|---|---|
+| 1 node, 4 GPUs (NVLink) | 16k | full | 1.917 | 2.949 | 2.789 (tile 2048) | **1.06x** |
+| 1 node, 4 GPUs (NVLink) | 64k | full | 30.0 | 33.1 | 34.2 (tile 8192) | **0.97x** |
+| 1 node, 4 GPUs (NVLink) | 16k | causal | 1.118 | 2.151 | 1.888 (tile 2048) | **1.14x** |
+| 1 node, 4 GPUs (NVLink) | 64k | causal | 16.1 | 20.2 | 18.6 (tile 4096) | **1.08x** |
+| 2 nodes, 8 GPUs (Slingshot) | 16k | full | 1.057 | 3.097 | 2.272 (tile 2048) | **1.36x** |
+| 2 nodes, 8 GPUs (Slingshot) | 64k | full | 14.8 | 22.2 | 17.0 (tile 4096) | **1.31x** |
+| 2 nodes, 8 GPUs (Slingshot) | 16k | causal | 0.733 | 2.929 | 1.795 (tile 2048) | **1.63x** |
+| 2 nodes, 8 GPUs (Slingshot) | 64k | causal | 7.761 | 15.3 | 9.836 (tile 4096) | **1.55x** |
+
+Three takeaways:
+
+1. **Overlap pays off when communication is expensive.** The cost model (`cost_model.py`, fitted from AllReduce-only timings) gives `t_allreduce = 56 us + bytes / 126 GB/s` inside a node and `202 us + bytes / 41.5 GB/s` across two nodes. At 16k tokens the one-shot AllReduce costs 0.6 ms on NVLink but 1.8 ms across nodes, more than the attention itself. Across nodes, streaming hides most of the attention under the communication; on one node there is little communication to hide and streaming roughly breaks even.
+2. **Causal masking makes overlap more valuable.** It halves the attention FLOPs (the measured time drops 30-50%), so communication is a larger share of the pass, and early tiles finish early, which starts the AllReduce pipeline sooner. On two nodes at 16k the causal `stream` pass (1.80 ms) costs about the same as the one-shot AllReduce alone (1.82 ms): the attention is completely hidden.
+3. **The simple model explains the multi-node numbers but not the single-node ones.** Across nodes the model predicts `stream` within 1-9%. On one node the measured time is 12-55% above the prediction, because NCCL's AllReduce kernels need whole SMs and have to wait for attention blocks to drain (finding 3 below). Overlap is not free: communication competes with compute for the same SMs.
+
 ## What's in the repo
 
 | File | What it is |
@@ -60,15 +83,17 @@ srun -n 4 --gpus-per-node=4 --gpu-bind=none ./build/attn_tests
 srun -n 4 --gpus-per-node=4 --gpu-bind=none ./build/attn_bench --S 16384 --tile 2048 --split 4 --ncomm 4 --modes attn,megatron,stream
 ```
 
-`perlmutter/env.sh` also sets `NCCL_PROTO=Simple`: with NCCL 2.29.2 and the libfabric plugin, inter-node AllReduces of 512 KB or less hung under the LL and LL128 protocols (larger messages and single-node runs were fine). The multi-node tables below were measured before that setting was added; only the small test configurations needed it. With it, `attn_tests` passes 108 configurations on 8 GPUs across 2 nodes.
+`perlmutter/env.sh` also sets `NCCL_PROTO=Simple`: with NCCL 2.29.2 and the libfabric plugin, inter-node AllReduces of 512 KB or less hung under the LL and LL128 protocols (larger messages and single-node runs were fine). The multi-node tables under Detailed results were measured before that setting was added (the headline run used it); only the small test configurations needed it. With it, `attn_tests` passes 108 configurations on 8 GPUs across 2 nodes.
 
 `attn_bench --help` lists the knobs: `--S --H --d_h` (model shape), `--tile` (rows per pipeline tile), `--split` (split-KV factor), `--ncomm` (NCCL communicators, so up to that many tile AllReduces run concurrently), `--nbuf`, `--kernel tc|v1`, `--causal`, `--proj fp32|tf32|bf16` (projection GEMM precision; bf16 also stores the attention output in bf16), `--gctx_sms N` (reserve N SMs for communication with CUDA green contexts), `--no_proj/--no_comm` (drop a stage to isolate costs).
 
-Status of the newer options (added 2026-09-15 after this project's GPU allocation ran out): `--causal`, `--proj bf16` and `--gctx_sms` pass `attn_tests` (372 configurations) on a single GPU and have single-GPU smoke numbers below, but no multi-GPU measurements yet. `bench_sweep.py` suites `causal`, `bf16`, `comm` and `model` cover them; run `sbatch -N 2 perlmutter/bench.sbatch` when hours are available and `python3 cost_model.py results/<csv>` to fit the AllReduce cost model from the `comm` suite.
+Status of the newer options: `--causal` is measured on 1 and 2 nodes (headline table above; `bench_sweep.py --suite core,comm`). `--proj bf16` and `--gctx_sms` pass `attn_tests` (372 configurations) and have single-GPU smoke numbers below but no multi-GPU measurements yet (`bf16`, `model` suites). `python3 cost_model.py results/<csv>` fits the AllReduce cost model from the `comm` suite.
 
-## Results
+## Detailed results (2026-09-14)
 
-Measured 2026-09-14 on NERSC Perlmutter (A100-SXM4-40GB, 4 per node with NVLink, Slingshot-11 between nodes; CUDA 13.2, NCCL 2.29, cray-mpich 9.1). Model shape unless stated: `H=16`, `d_h=64` (`d=1024`), heads split across ranks. Times are wall-clock milliseconds for the full attention + projection + AllReduce, max over ranks, median of 5 trials. Raw CSVs are in `results/`; regenerate the tables with `python3 bench_tables.py results/*.csv`. The original-code column comes from the pre-rewrite kernel run on the same node type before any changes.
+The earlier, broader sweep. It predates `NCCL_PROTO=Simple` and the headline run, so compare rows within this section rather than against the headline table.
+
+Measured 2026-09-14 on NERSC Perlmutter (A100-SXM4-40GB, 4 per node with NVLink, Slingshot-11 between nodes; CUDA 13.2, NCCL 2.29, cray-mpich 9.1). Model shape unless stated: `H=16`, `d_h=64` (`d=1024`), heads split across ranks. Times are wall-clock milliseconds for the full attention + projection + AllReduce, max over ranks, median of 5 trials. Raw CSVs are in `results/`; regenerate the tables with `python3 bench_tables.py results/n1_r4.csv results/n2_r8.csv`. The original-code column comes from the pre-rewrite kernel run on the same node type before any changes.
 
 <!-- results:begin (generated by bench_tables.py) -->
 ### Attention kernel (attention only, 4 GPUs on one node, H=16, d_h=64, 4 local heads per GPU)
@@ -138,7 +163,7 @@ These came out of `nsys` traces and the `--no_proj/--no_comm` isolation knobs. T
 
 Implemented, tested for correctness, and smoke-timed on a single A100-PCIe login-node GPU (shared with other users, so treat the numbers as indicative only; multi-GPU sweeps are pending GPU hours):
 
-- **Causal masking** (`--causal`). Attention only, 16k tokens, 16 heads on one GPU: 10.3 ms full vs 4.4 ms causal. Tile *t* now costs work proportional to *t*, so early tiles finish early and the projection/AllReduce pipeline gets a head start; expect `stream` to gain relative to one-shot, which the `causal` sweep suite measures. Split-KV hurts causal on one GPU (7.0 ms with `--split 4`): high splits have idle blocks for early rows and the combine still reads every split, so the split should become row-dependent.
+- **Causal masking** (`--causal`): now measured, see the headline table. Single GPU, attention only, 16k tokens, 16 heads: 10.3 ms full vs 4.4 ms causal. On 8 GPUs, split-KV made little difference for causal `stream` (within 6% either way: split 1 was better at 16k, split 4 at 64k), so the row-dependent split idea below is low priority.
 - **bf16 projection** (`--proj bf16`). The attention kernel and the split-KV combine write bf16 directly and the projection is a bf16 tensor-core GEMM with fp32 accumulation. Llama-shaped layer (H=32, d_h=128), 4k tokens on one GPU, one-shot pass: 16.8 ms with the fp32 projection, 3.8 ms with TF32, 2.7 ms with bf16, against a 2.0 ms attention floor. Relative error against the fp32 reference stays under 4e-3.
 - **Green-context SM partitioning** (`--gctx_sms N`, optionally `--gctx_proj`). Directly targets finding 3 above: the communication streams get their own SMs so NCCL blocks never wait for the attention kernel to drain an SM, at the price of `N` fewer SMs for attention. The partition is granted at the requested size (8 and 16 SMs verified) and all modes run on it. Sweep `N` in {8, 16, 24} with `--ncomm` and `NCCL_MAX_NCHANNELS <= N` on 2 nodes.
 - **Cost model** (`cost_model.py`, `comm` suite). Fits `t_allreduce(bytes) = alpha + bytes / bandwidth` from AllReduce-only timings and predicts `stream` time as the larger of attention, `n * alpha / ncomm + bytes / bandwidth`, and projection, plus the last tile's tail. Compare its predictions with the measured `stream` rows to see how far the pipeline is from the model's floor.

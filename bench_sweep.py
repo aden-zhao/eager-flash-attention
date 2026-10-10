@@ -7,6 +7,7 @@ Run inside a Slurm allocation (or pass --jobid for a background `salloc --no-she
     python3 bench_sweep.py --suite modes --nodes 2 --ranks 8 --jobid 12345 --out results/n2_r8.csv
 
 Suites:
+  core     megatron vs stream, causal and not, S=16k and 64k (the headline result)
   kernel   v1 vs tensor-core kernel, attention only
   modes    megatron / sync / overlap / stream across S and tile size
   scaling  megatron vs stream while varying the number of ranks (1..ranks)
@@ -69,6 +70,15 @@ def tiles_for(S):
 
 suites = args.suite.split(",") if args.suite != "all" else ["kernel", "modes", "scaling", "model", "causal", "bf16"]
 R = args.ranks
+
+if "core" in suites:
+    for causal in [[], ["--causal"]]:
+        for S in [16384, 65536]:
+            run(R, ["--S", S, "--kernel", "tc", "--modes", "attn,megatron"] + causal)
+            for tile in [S // 16, S // 8]:
+                for split in ([1, args.split] if causal else [args.split]):
+                    run(R, ["--S", S, "--kernel", "tc", "--tile", tile, "--split", split,
+                            "--ncomm", NCOMM, "--modes", "stream"] + causal)
 
 if "kernel" in suites:
     for S in [1024, 4096, 16384, 65536]:

@@ -2,13 +2,15 @@
 """Render the README result tables (markdown) from bench_sweep.py CSVs.
 
     python3 bench_tables.py results/n1_r4.csv results/n2_r8.csv
+    python3 bench_tables.py --headline results/core_n1_r4.csv results/core_n2_r8.csv
 """
 import csv
 import sys
 from collections import OrderedDict
 
+headline = "--headline" in sys.argv
 rows = []
-for path in sys.argv[1:]:
+for path in [a for a in sys.argv[1:] if a != "--headline"]:
     with open(path) as f:
         for r in csv.DictReader(f):
             r["_src"] = path
@@ -27,6 +29,25 @@ def find(**kw):
 
 def fmt(ms):
     return f"{ms:.3f}" if ms < 10 else f"{ms:.1f}"
+
+# ---- headline: one-shot vs stream, 1 vs 2 nodes, causal or not ------------
+if headline:
+    print("| setup | S | mask | attention only | one-shot (megatron) | stream (best tile) | speedup |")
+    print("|---|---|---|---|---|---|---|")
+    for R, setup in [("4", "1 node, 4 GPUs (NVLink)"), ("8", "2 nodes, 8 GPUs (Slingshot)")]:
+        for causal in ["0", "1"]:
+            for S in ["16384", "65536"]:
+                s = [r for r in all_rows if r["R"] == R and r["causal"] == causal and r["S"] == S]
+                def best(mode):
+                    c = [r for r in s if r["mode"] == mode]
+                    return min(c, key=med) if c else None
+                a, m, st = best("attn"), best("megatron"), best("stream")
+                if not (a and m and st): continue
+                mask = "causal" if causal == "1" else "full"
+                print(f"| {setup} | {int(S)//1024}k | {mask} | {fmt(med(a))} | {fmt(med(m))} | "
+                      f"{fmt(med(st))} (tile {st['tile']}) | **{med(m)/med(st):.2f}x** |")
+    print()
+    sys.exit(0)
 
 # ---- kernel table -------------------------------------------------------
 print("### Attention kernel (attention only, 4 GPUs on one node, H=16, d_h=64, 4 local heads per GPU)\n")
