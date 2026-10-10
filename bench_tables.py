@@ -15,9 +15,8 @@ for path in [a for a in sys.argv[1:] if a != "--headline"]:
         for r in csv.DictReader(f):
             r["_src"] = path
             r.setdefault("causal", "0")   # older CSVs predate the column
-            r.setdefault("gctx", "0")
             rows.append(r)
-all_rows = [r for r in rows if r["gctx"] == "0"]
+all_rows = rows
 rows = [r for r in all_rows if r["causal"] == "0"]
 
 def med(r): return float(r["median_ms"])
@@ -103,7 +102,7 @@ if sc:
         print(f"| {R} | {g('attn')} | {g('megatron')} | {g('overlap')} | {g('stream')} |")
     print()
 
-# ---- causal / bf16 variants (default shape) ------------------------------
+# ---- causal variant (default shape) -----------------------------------
 def variant_table(sel, title):
     sub = [r for r in all_rows if sel(r) and r["H"] == "16"]
     if not sub: return
@@ -123,7 +122,6 @@ def variant_table(sel, title):
     print()
 
 variant_table(lambda r: r["causal"] == "1" and r["proj"] == "fp32", "Causal attention (H=16, d_h=64)")
-variant_table(lambda r: r["causal"] == "0" and r["proj"] == "bf16", "bf16 projection (H=16, d_h=64)")
 
 # ---- model --------------------------------------------------------------
 md = [r for r in rows if r["H"] == "32"]
@@ -132,7 +130,7 @@ if md:
     print("| ranks | projection | attn only | megatron | overlap (best) | stream (best) | stream vs megatron |")
     print("|---|---|---|---|---|---|---|")
     for R in sorted({r["R"] for r in md}, key=int):
-        for proj in ["fp32", "tf32", "bf16"]:
+        for proj in ["fp32", "tf32"]:
             s = [r for r in md if r["R"] == R and r["proj"] == proj]
             if not s: continue
             def g(mode):

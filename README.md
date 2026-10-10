@@ -85,9 +85,9 @@ srun -n 4 --gpus-per-node=4 --gpu-bind=none ./build/attn_bench --S 16384 --tile 
 
 `perlmutter/env.sh` also sets `NCCL_PROTO=Simple`: with NCCL 2.29.2 and the libfabric plugin, inter-node AllReduces of 512 KB or less hung under the LL and LL128 protocols (larger messages and single-node runs were fine). The multi-node tables under Detailed results were measured before that setting was added (the headline run used it); only the small test configurations needed it. With it, `attn_tests` passes 108 configurations on 8 GPUs across 2 nodes.
 
-`attn_bench --help` lists the knobs: `--S --H --d_h` (model shape), `--tile` (rows per pipeline tile), `--split` (split-KV factor), `--ncomm` (NCCL communicators, so up to that many tile AllReduces run concurrently), `--nbuf`, `--kernel tc|v1`, `--causal`, `--proj fp32|tf32|bf16` (projection GEMM precision; bf16 also stores the attention output in bf16), `--gctx_sms N` (reserve N SMs for communication with CUDA green contexts), `--no_proj/--no_comm` (drop a stage to isolate costs).
+`attn_bench --help` lists the knobs: `--S --H --d_h` (model shape), `--tile` (rows per pipeline tile), `--split` (split-KV factor), `--ncomm` (NCCL communicators, so up to that many tile AllReduces run concurrently), `--nbuf`, `--kernel tc|v1`, `--causal`, `--proj fp32|tf32` (projection GEMM precision), `--no_proj/--no_comm` (drop a stage to isolate costs).
 
-Status of the newer options: `--causal` is measured on 1 and 2 nodes (headline table above; `bench_sweep.py --suite core,comm`). `--proj bf16` and `--gctx_sms` pass `attn_tests` (372 configurations) and have single-GPU smoke numbers below but no multi-GPU measurements yet (`bf16`, `model` suites). `python3 cost_model.py results/<csv>` fits the AllReduce cost model from the `comm` suite.
+`python3 cost_model.py results/<csv>` fits the AllReduce cost model from the `comm` suite and compares its `stream` predictions with the measured rows.
 
 ## Detailed results (2026-09-14)
 
@@ -155,20 +155,15 @@ These came out of `nsys` traces and the `--no_proj/--no_comm` isolation knobs. T
 
 2. **Wave quantization.** With one big launch, 1024 blocks run four per SM in about 2.4 waves, so without split-KV tiles complete in three bursts rather than steadily, and the comm stream is left with a burst of AllReduces after attention has finished. Split-KV makes blocks ~8x shorter and completions smooth. Grid order matters here: `(head, split)` must be the fast grid index so blocks are dispatched in query-row order; with the split as the slow index the first tile only completed at 85% of the launch.
 
-3. **NCCL blocks need a whole SM.** The ring-LL AllReduce kernel runs 22 blocks of 640 threads at 96 registers with 96 KB of shared memory: 61K of the SM's 64K registers. It cannot share an SM with even one attention block (128 threads x 128 registers, 4 per SM = the full register file), so each tile's AllReduce waits until whole SMs drain. Capping attention occupancy (`--reserve`) did not help because the freed slot is still too small; `NCCL_MAX_NCHANNELS=4` (fewer, hence fewer SMs) helped `stream` by ~10% on one node but slows the one-shot AllReduce.
+3. **NCCL blocks need a whole SM.** The ring-LL AllReduce kernel runs 22 blocks of 640 threads at 96 registers with 96 KB of shared memory: 61K of the SM's 64K registers. It cannot share an SM with even one attention block (128 threads x 128 registers, 4 per SM = the full register file), so each tile's AllReduce waits until whole SMs drain. Capping attention occupancy (an experiment since removed) did not help because the freed slot is still too small; `NCCL_MAX_NCHANNELS=4` (fewer, hence fewer SMs) helped `stream` by ~10% on one node but slows the one-shot AllReduce.
 
 4. **Small AllReduces are latency-bound.** On one node the 64 MB one-shot AllReduce takes ~0.5 ms; 32 AllReduces of 2 MB take ~55 us each when alone (1.8 ms total) and more when contending. So on NVLink there is at most ~1 ms of exposed communication to recover and streaming roughly breaks even. Across two nodes the per-op cost is ~5x higher, the one-shot AllReduce is ~1.8 ms, and streaming with several communicators in flight (`--ncomm 4..8`) is where the design pays off.
 
-## Next experiments
+## Possible next steps
 
-Implemented, tested for correctness, and smoke-timed on a single A100-PCIe login-node GPU (shared with other users, so treat the numbers as indicative only; multi-GPU sweeps are pending GPU hours):
-
-- **Causal masking** (`--causal`): now measured, see the headline table. Single GPU, attention only, 16k tokens, 16 heads: 10.3 ms full vs 4.4 ms causal. On 8 GPUs, split-KV made little difference for causal `stream` (within 6% either way: split 1 was better at 16k, split 4 at 64k), so the row-dependent split idea below is low priority.
-- **bf16 projection** (`--proj bf16`). The attention kernel and the split-KV combine write bf16 directly and the projection is a bf16 tensor-core GEMM with fp32 accumulation. Llama-shaped layer (H=32, d_h=128), 4k tokens on one GPU, one-shot pass: 16.8 ms with the fp32 projection, 3.8 ms with TF32, 2.7 ms with bf16, against a 2.0 ms attention floor. Relative error against the fp32 reference stays under 4e-3.
-- **Green-context SM partitioning** (`--gctx_sms N`, optionally `--gctx_proj`). Directly targets finding 3 above: the communication streams get their own SMs so NCCL blocks never wait for the attention kernel to drain an SM, at the price of `N` fewer SMs for attention. The partition is granted at the requested size (8 and 16 SMs verified) and all modes run on it. Sweep `N` in {8, 16, 24} with `--ncomm` and `NCCL_MAX_NCHANNELS <= N` on 2 nodes.
-- **Cost model** (`cost_model.py`, `comm` suite). Fits `t_allreduce(bytes) = alpha + bytes / bandwidth` from AllReduce-only timings and predicts `stream` time as the larger of attention, `n * alpha / ncomm + bytes / bandwidth`, and projection, plus the last tile's tail. Compare its predictions with the measured `stream` rows to see how far the pipeline is from the model's floor.
-
-Not yet implemented: 4-node scaling with the same sweep script (`sbatch -N 4`), a copy-engine AllReduce for the single-node case, row-dependent split-KV for causal, and fusing the combine into the projection GEMM prologue.
+- **Give communication its own SMs** with CUDA green contexts, so NCCL never waits for attention blocks to drain (finding 3). This would target the single-node gap between the cost model and the measurements. A prototype was built and removed to keep the code simple.
+- **bf16 attention output and projection.** On one GPU it cut the Llama-shaped one-shot pass from 3.8 ms (TF32) to 2.7 ms, but it speeds up the projection rather than the overlap, so it was removed as well.
+- 4-node scaling (`sbatch -N 4`), a copy-engine AllReduce for the single-node case, and fusing the split-KV combine into the projection GEMM.
 
 ## Related work
 

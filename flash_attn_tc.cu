@@ -1,6 +1,5 @@
 #include "flash_attn_tc.cuh"
 
-#include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -77,9 +76,9 @@ flash_attn_tc_kernel(
     const half* __restrict__ Q,
     const half* __restrict__ K,
     const half* __restrict__ V,
-    void*       __restrict__ O_void,
+    float*      __restrict__ O,
     FlashAttnTCPartials part,
-    int q_start, int S, int H_local, int nsplit, int kv_len, int causal, int out_bf16,
+    int q_start, int S, int H_local, int nsplit, int kv_len, int causal,
     float scale_log2e, int* __restrict__ tile_counters, int tile_rows)
 {
     constexpr int BM  = FLASH_TC_BM;
@@ -273,27 +272,16 @@ flash_attn_tc_kernel(
     // ---- epilogue ----
     const size_t ld_o = (size_t)H_local * D;
     if (nsplit == 1) {
-        // normalize and store (fp32 or bf16)
+        // normalize and store
         const float inv0 = 1.f / l[0];
         const float inv1 = 1.f / l[1];
-        const size_t off0 = (size_t)(local_row0 + g) * ld_o + head * D;
-        const size_t off1 = off0 + 8 * ld_o;
-        if (out_bf16) {
-            __nv_bfloat16* Ob = reinterpret_cast<__nv_bfloat16*>(O_void);
-            #pragma unroll
-            for (int dt = 0; dt < DT; dt++) {
-                const int col = dt * 8 + 2 * c;
-                *reinterpret_cast<__nv_bfloat162*>(Ob + off0 + col) = __floats2bfloat162_rn(o[dt][0] * inv0, o[dt][1] * inv0);
-                *reinterpret_cast<__nv_bfloat162*>(Ob + off1 + col) = __floats2bfloat162_rn(o[dt][2] * inv1, o[dt][3] * inv1);
-            }
-        } else {
-            float* O = reinterpret_cast<float*>(O_void);
-            #pragma unroll
-            for (int dt = 0; dt < DT; dt++) {
-                const int col = dt * 8 + 2 * c;
-                *reinterpret_cast<float2*>(O + off0 + col) = make_float2(o[dt][0] * inv0, o[dt][1] * inv0);
-                *reinterpret_cast<float2*>(O + off1 + col) = make_float2(o[dt][2] * inv1, o[dt][3] * inv1);
-            }
+        float* O0 = O + (size_t)(local_row0 + g) * ld_o + head * D;
+        float* O1 = O0 + 8 * ld_o;
+        #pragma unroll
+        for (int dt = 0; dt < DT; dt++) {
+            const int col = dt * 8 + 2 * c;
+            *reinterpret_cast<float2*>(O0 + col) = make_float2(o[dt][0] * inv0, o[dt][1] * inv0);
+            *reinterpret_cast<float2*>(O1 + col) = make_float2(o[dt][2] * inv1, o[dt][3] * inv1);
         }
     } else {
         // split-KV: store unnormalized partial + (m, l) for a later combine
@@ -330,7 +318,7 @@ flash_attn_tc_kernel(
 // One thread per (row, column pair): O = sum_i 2^(m_i - M) O_i / sum_i 2^(m_i - M) l_i
 static __global__ void combine_kernel(
     const float* __restrict__ O_part, const float* __restrict__ m_part,
-    const float* __restrict__ l_part, void* __restrict__ O_void, int out_bf16,
+    const float* __restrict__ l_part, float* __restrict__ O,
     int row0, int rows, int ws_rows, int d_local, int H_local, int d_h, int split)
 {
     const int pairs = d_local / 2;
@@ -357,61 +345,45 @@ static __global__ void combine_kernel(
         acc.y += w * v.y;
     }
     const float inv = 1.f / L;
-    const size_t off = (size_t)r * d_local + col;
-    if (out_bf16)
-        *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(O_void) + off) =
-            __floats2bfloat162_rn(acc.x * inv, acc.y * inv);
-    else
-        *reinterpret_cast<float2*>(reinterpret_cast<float*>(O_void) + off) = make_float2(acc.x * inv, acc.y * inv);
+    *reinterpret_cast<float2*>(O + (size_t)r * d_local + col) = make_float2(acc.x * inv, acc.y * inv);
 }
 
 void flash_attn_tc_combine(
-    const FlashAttnTCPartials& part, void* O, int row0, int rows,
+    const FlashAttnTCPartials& part, float* O, int row0, int rows,
     const FlashAttnTCParams& p, cudaStream_t stream)
 {
     const int d_local = p.H_local * p.d_h;
     const int total = rows * (d_local / 2);
     const int blocks = (total + 255) / 256;
     combine_kernel<<<blocks, 256, 0, stream>>>(
-        part.O_part, part.m_part, part.l_part, O, p.out_bf16,
+        part.O_part, part.m_part, part.l_part, O,
         row0, rows, part.rows, d_local, p.H_local, p.d_h, p.split);
 }
 
 template <int D>
 static void launch_tc(
     const half* Q, const half* K, const half* V,
-    void* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
+    float* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
     const FlashAttnTCParams& p, cudaStream_t stream,
     int* tile_counters, int tile_rows)
 {
-    constexpr size_t smem_needed = 4ull * FLASH_TC_BN * (D + 8) * sizeof(half);
-    size_t smem = smem_needed;
-    if (p.max_blocks_per_sm > 0) {
-        // Ask for enough shared memory that only max_blocks_per_sm blocks fit per SM.
-        // (1 KB per block is reserved by the hardware on Ampere.)
-        static int sm_smem = 0;
-        if (sm_smem == 0) {
-            int dev; cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sm_smem, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
-        }
-        size_t cap = (size_t)sm_smem / (p.max_blocks_per_sm + 1) + 1024;
-        if (cap > smem) smem = cap;
-    }
-    static size_t configured = 0;
-    if (configured < smem) {
+    // Double-buffered K and V chunks; above 48 KB for d_h=128, so opt in once.
+    constexpr size_t smem = 4ull * FLASH_TC_BN * (D + 8) * sizeof(half);
+    static bool configured = false;
+    if (!configured) {
         cudaFuncSetAttribute(flash_attn_tc_kernel<D>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        configured = smem;
+        configured = true;
     }
     dim3 grid(p.H_local * p.split, q_rows / FLASH_TC_BM);
     flash_attn_tc_kernel<D><<<grid, 128, smem, stream>>>(
-        Q, K, V, O, part, q_start, p.S, p.H_local, p.split, p.S / p.split, p.causal, p.out_bf16,
+        Q, K, V, O, part, q_start, p.S, p.H_local, p.split, p.S / p.split, p.causal,
         p.scale * 1.4426950408889634f, tile_counters, tile_rows);
 }
 
 void flash_attn_tc_forward(
     const half* Q, const half* K, const half* V,
-    void* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
+    float* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
     const FlashAttnTCParams& p, cudaStream_t stream,
     int* tile_counters, int tile_rows)
 {

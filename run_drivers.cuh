@@ -20,7 +20,7 @@ const char* mode_name(int mode);
 int parse_mode(const char* s);   // -1 if unknown
 
 // All drivers write the full [S][d] reduced output to `output` (except the
-// attention-only modes, which leave it untouched) and return the wall time,
-// maxed across ranks.
-RunResult run_mode(int mode, const Weights& w, float* output,
+// attention-only modes, which leave it untouched) and return the wall time in
+// ms, maxed across ranks.
+double run_mode(int mode, const Weights& w, float* output,
                    const AttnParams& p, const RunCtx& c);

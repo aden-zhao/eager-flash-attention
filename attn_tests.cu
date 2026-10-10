@@ -48,9 +48,7 @@ static void reference(const Weights& w, const AttnParams& p, const RunCtx& c, fl
         &beta, P_local, p.d));
     CUDA_CHECK(cudaStreamSynchronize(c.proj_stream));
 
-    // Reference reduction: one plain NCCL AllReduce on communicator 0, fully
-    // synchronized. (A large MPI_Allreduce here, on device or host buffers,
-    // hangs across nodes on Perlmutter once NCCL's libfabric plugin is loaded.)
+    // Reference reduction: one plain NCCL AllReduce on communicator 0, fully synchronized.
     CUDA_CHECK(cudaDeviceSynchronize());
     NCCL_CHECK(ncclAllReduce(P_local, out_base, (size_t)p.S * p.d, ncclFloat, ncclSum,
                              c.nccls[0], c.comm_streams[0]));
@@ -86,34 +84,29 @@ int main(int argc, char** argv)
     };
     const int seeds[] = { 42, 123, 777 };
     const int kernels[] = { KERNEL_V1, KERNEL_TC };
-    // (kernel, projection) variants: v1/fp32, tc/fp32, tc/bf16
-    struct Variant { int kernel, proj; };
-    const Variant variants[] = { { KERNEL_V1, PROJ_FP32 }, { KERNEL_TC, PROJ_FP32 }, { KERNEL_TC, PROJ_BF16 } };
-    (void)kernels;
     const int modes[] = { MODE_MEGATRON, MODE_SYNC, MODE_OVERLAP, MODE_STREAM };
 
     int total_pass = 0, total_fail = 0, total_skip = 0;
 
     for (const auto& tc : cases) {
-        for (const Variant& v : variants) {
-            const int kernel = v.kernel;
+        for (int kernel : kernels) {
             AttnParams p = make_params(tc.S, tc.d, tc.H, tc.tile, tc.B_M, tc.B_N,
-                                       kernel, tc.nbuf, tc.split, tc.causal, v.proj, world_size);
+                                       kernel, tc.nbuf, tc.split, tc.causal, world_size);
             const char* why = attn_check_params(p, device);
             if (why) {
                 if (rank == 0)
-                    printf("SKIP  kernel=%s proj=%s S=%d d=%d H=%d tile=%d split=%d causal=%d: %s\n",
-                           kernel_name(kernel), proj_name(v.proj), tc.S, tc.d, tc.H, tc.tile, tc.split, tc.causal, why);
+                    printf("SKIP  kernel=%s S=%d d=%d H=%d tile=%d split=%d causal=%d: %s\n",
+                           kernel_name(kernel), tc.S, tc.d, tc.H, tc.tile, tc.split, tc.causal, why);
                 total_skip++;
                 continue;
             }
-            // fp16 inputs and fp16 P: ~1e-3 relative; bf16 output + bf16 GEMM: ~5e-3; fp32 fast-math: ~1e-5.
-            const float rtol = (v.proj == PROJ_BF16) ? 3e-2f : (kernel == KERNEL_TC) ? 2e-2f : 1e-3f;
+            // fp16 inputs and fp16 P: ~1e-3 relative; fp32 fast-math: ~1e-5.
+            const float rtol = (kernel == KERNEL_TC) ? 2e-2f : 1e-3f;
 
             for (int seed : seeds) {
                 if (rank == 0)
-                    printf("\nkernel=%s proj=%s S=%d d=%d H=%d d_h=%d tile=%d B_M=%d B_N=%d nbuf=%d split=%d causal=%d seed=%d R=%d\n",
-                           kernel_name(kernel), proj_name(v.proj), tc.S, tc.d, tc.H, p.d_h, tc.tile,
+                    printf("\nkernel=%s S=%d d=%d H=%d d_h=%d tile=%d B_M=%d B_N=%d nbuf=%d split=%d causal=%d seed=%d R=%d\n",
+                           kernel_name(kernel), tc.S, tc.d, tc.H, p.d_h, tc.tile,
                            tc.B_M, tc.B_N, tc.nbuf, tc.split, tc.causal, seed, world_size);
 
                 Weights w = allocate_and_fill(p, rank, seed, ctx.compute_stream);

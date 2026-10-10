@@ -19,10 +19,6 @@ struct FlashAttnTCParams {
     int   H_local;
     int   split;    // split-KV factor: each block sweeps S / split keys (1 = no split)
     int   causal;   // 1 = query row i attends keys j <= i only
-    int   out_bf16; // 1 = O is __nv_bfloat16 instead of float
-    int   max_blocks_per_sm;   // 0 = hardware default (4 on A100 for d_h=64); smaller values
-                               // pad the shared-memory request so each SM keeps room for
-                               // projection / communication kernels running alongside
     float scale;
 };
 
@@ -41,15 +37,14 @@ constexpr int FLASH_TC_BM = 64;   // query rows per block
 constexpr int FLASH_TC_BN = 64;   // K/V rows per shared-memory chunk
 
 // Q, K, V: half [H_local][S][d_h] head-major.
-// O: [q_rows][H_local * d_h] sequence-major (float, or bf16 when p.out_bf16),
-//    rows q_start .. q_start + q_rows. Written directly when p.split == 1;
+// O: [q_rows][H_local * d_h] sequence-major, rows q_start .. q_start + q_rows. Written directly when p.split == 1;
 //    otherwise partials go to `part` and O is untouched until flash_attn_tc_combine.
 // If tile_counters != nullptr, every block atomically increments
 // tile_counters[(row within launch) / tile_rows] after its output rows are
 // globally visible, so a consumer can wait for a tile with cuStreamWaitValue32.
 void flash_attn_tc_forward(
     const half* Q, const half* K, const half* V,
-    void* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
+    float* O, const FlashAttnTCPartials& part, int q_start, int q_rows,
     const FlashAttnTCParams& p, cudaStream_t stream,
     int* tile_counters = nullptr, int tile_rows = 0
 );
@@ -57,7 +52,7 @@ void flash_attn_tc_forward(
 // Merge the split partials for workspace rows [row0, row0 + rows) into
 // O[0 .. rows) (O points at the first of those rows).
 void flash_attn_tc_combine(
-    const FlashAttnTCPartials& part, void* O, int row0, int rows,
+    const FlashAttnTCPartials& part, float* O, int row0, int rows,
     const FlashAttnTCParams& p, cudaStream_t stream
 );
 

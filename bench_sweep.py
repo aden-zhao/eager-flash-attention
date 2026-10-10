@@ -11,9 +11,8 @@ Suites:
   kernel   v1 vs tensor-core kernel, attention only
   modes    megatron / sync / overlap / stream across S and tile size
   scaling  megatron vs stream while varying the number of ranks (1..ranks)
-  model    a Llama-7B-shaped layer (H=32, d_h=128) with fp32, TF32 and bf16 projection
+  model    a Llama-7B-shaped layer (H=32, d_h=128) with fp32 and TF32 projection
   causal   modes with causal masking (tile completion is front-loaded)
-  bf16     modes with the bf16 projection at the default shape
   comm     AllReduce-only timings across tile sizes (input for the cost model)
 """
 import argparse
@@ -68,7 +67,7 @@ def tiles_for(S):
     return sorted({max(256, S // 32), max(256, S // 16), max(256, S // 8)})
 
 
-suites = args.suite.split(",") if args.suite != "all" else ["kernel", "modes", "scaling", "model", "causal", "bf16"]
+suites = args.suite.split(",") if args.suite != "all" else ["kernel", "modes", "scaling", "model", "causal"]
 R = args.ranks
 
 if "core" in suites:
@@ -105,7 +104,7 @@ if "scaling" in suites:
 
 if "model" in suites:
     S = 16384
-    for proj in ["fp32", "tf32", "bf16"]:
+    for proj in ["fp32", "tf32"]:
         run(R, ["--S", S, "--H", 32, "--d_h", 128, "--kernel", "tc", "--proj", proj, "--modes", "attn,megatron"])
         for tile in [1024, 2048]:
             run(R, ["--S", S, "--H", 32, "--d_h", 128, "--kernel", "tc", "--proj", proj, "--tile", tile,
@@ -122,13 +121,6 @@ if "comm" in suites:
     S = 16384
     for tile in [256, 512, 1024, 2048, 4096, 8192, 16384]:
         run(R, ["--S", S, "--kernel", "tc", "--tile", tile, "--modes", "comm"])
-
-if "bf16" in suites:
-    for S in [16384, 65536]:
-        run(R, ["--S", S, "--kernel", "tc", "--proj", "bf16", "--modes", "attn,megatron"])
-        for tile in tiles_for(S):
-            run(R, ["--S", S, "--kernel", "tc", "--proj", "bf16", "--tile", tile, "--split", args.split,
-                    "--ncomm", NCOMM, "--modes", "overlap,stream"])
 
 out.close()
 print("# done ->", args.out)

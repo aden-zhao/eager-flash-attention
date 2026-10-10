@@ -26,7 +26,6 @@ def load(paths):
         with open(p) as f:
             for r in csv.DictReader(f):
                 r.setdefault("causal", "0")
-                r.setdefault("gctx", "0")
                 rows.append(r)
     return rows
 

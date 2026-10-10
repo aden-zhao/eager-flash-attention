@@ -45,37 +45,37 @@ static double finish_timing(double t0, MPI_Comm comm)
 
 // ---------------------------------------------------------------------------
 
-static RunResult run_attn_only(const Weights& w, const AttnParams& p, const RunCtx& c, bool tiled)
+static double run_attn_only(const Weights& w, const AttnParams& p, const RunCtx& c, bool tiled)
 {
-    void* O_all = nullptr;
-    CUDA_CHECK(cudaMalloc(&O_all, (size_t)p.S * p.d_local * o_elem_bytes(p)));
-    AttnWorkspace ws = alloc_workspace(p, tiled ? p.tile : p.S);
+    float* O_all = nullptr;
+    CUDA_CHECK(cudaMalloc(&O_all, (size_t)p.S * p.d_local * sizeof(float)));
+    FlashAttnTCPartials ws = alloc_workspace(p, tiled ? p.tile : p.S);
 
     MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
 
     if (tiled) {
         for (int t = 0; t < p.num_tiles; t++)
-            launch_attention(w, static_cast<char*>(O_all) + (size_t)t * p.tile * p.d_local * o_elem_bytes(p), ws, t * p.tile, p.tile, p, c.compute_stream);
+            launch_attention(w, O_all + (size_t)t * p.tile * p.d_local, ws, t * p.tile, p.tile, p, c.compute_stream);
     } else {
         launch_attention(w, O_all, ws, 0, p.S, p, c.compute_stream);
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(c.compute_stream));
 
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
     free_workspace(ws);
     CUDA_CHECK(cudaFree(O_all));
-    return r;
+    return ms;
 }
 
-static RunResult run_megatron(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+static double run_megatron(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
-    void* O_all = nullptr;
+    float* O_all = nullptr;
     float* send_buf = nullptr;
-    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * o_elem_bytes(p)));
+    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
-    AttnWorkspace ws = alloc_workspace(p, p.S);
+    FlashAttnTCPartials ws = alloc_workspace(p, p.S);
     cudaEvent_t attn_done, proj_done;
     CUDA_CHECK(cudaEventCreateWithFlags(&attn_done, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&proj_done, cudaEventDisableTiming));
@@ -95,23 +95,23 @@ static RunResult run_megatron(const Weights& w, float* output, const AttnParams&
     allreduce(c, 0, send_buf, output, (size_t)p.S * p.d, p);
     CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
 
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
 
     CUDA_CHECK(cudaEventDestroy(attn_done));
     CUDA_CHECK(cudaEventDestroy(proj_done));
     free_workspace(ws);
     CUDA_CHECK(cudaFree(O_all));
     CUDA_CHECK(cudaFree(send_buf));
-    return r;
+    return ms;
 }
 
-static RunResult run_sync(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+static double run_sync(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
-    void* O_tile = nullptr;
+    float* O_tile = nullptr;
     float* send_buf = nullptr;
-    CUDA_CHECK(cudaMalloc(&O_tile,   (size_t)p.tile * p.d_local * o_elem_bytes(p)));
+    CUDA_CHECK(cudaMalloc(&O_tile,   (size_t)p.tile * p.d_local * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.tile * p.d * sizeof(float)));
-    AttnWorkspace ws = alloc_workspace(p, p.tile);
+    FlashAttnTCPartials ws = alloc_workspace(p, p.tile);
 
     MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
@@ -128,11 +128,11 @@ static RunResult run_sync(const Weights& w, float* output, const AttnParams& p, 
         CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
     }
 
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
     free_workspace(ws);
     CUDA_CHECK(cudaFree(O_tile));
     CUDA_CHECK(cudaFree(send_buf));
-    return r;
+    return ms;
 }
 
 // Fully asynchronous pipeline. The host enqueues every tile up front; the
@@ -140,20 +140,20 @@ static RunResult run_sync(const Weights& w, float* output, const AttnParams& p, 
 //   compute:  attn(t)  [waits proj_done(t - nbuf): O_tile[b] free]
 //   proj:     gemm(t)  [waits attn_done(t), comm_done(t - nbuf): send_buf[b] free]
 //   comm[t % ncomm]: allreduce(t) [waits proj_done(t)]
-static RunResult run_overlap(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+static double run_overlap(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
     const int nbuf = p.nbuf;
-    std::vector<void*> O_tile(nbuf);
+    std::vector<float*> O_tile(nbuf);
     std::vector<float*> send_buf(nbuf);
     std::vector<cudaEvent_t> attn_done(nbuf), proj_done(nbuf), comm_done(nbuf);
     for (int b = 0; b < nbuf; b++) {
-        CUDA_CHECK(cudaMalloc(&O_tile[b],   (size_t)p.tile * p.d_local * o_elem_bytes(p)));
+        CUDA_CHECK(cudaMalloc(&O_tile[b],   (size_t)p.tile * p.d_local * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&send_buf[b], (size_t)p.tile * p.d * sizeof(float)));
         CUDA_CHECK(cudaEventCreateWithFlags(&attn_done[b], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&proj_done[b], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&comm_done[b], cudaEventDisableTiming));
     }
-    AttnWorkspace ws = alloc_workspace(p, p.tile);   // shared: attention + combine are stream-ordered
+    FlashAttnTCPartials ws = alloc_workspace(p, p.tile);   // shared: attention + combine are stream-ordered
 
     MPI_CHECK(MPI_Barrier(c.comm));
     double t0 = MPI_Wtime();
@@ -180,7 +180,7 @@ static RunResult run_overlap(const Weights& w, float* output, const AttnParams& 
     CUDA_CHECK(cudaGetLastError());
     sync_comm_streams(c);
 
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
 
     for (int b = 0; b < nbuf; b++) {
         CUDA_CHECK(cudaEventDestroy(attn_done[b]));
@@ -190,7 +190,7 @@ static RunResult run_overlap(const Weights& w, float* output, const AttnParams& 
         CUDA_CHECK(cudaFree(send_buf[b]));
     }
     free_workspace(ws);
-    return r;
+    return ms;
 }
 
 // Single attention launch over all S; the kernel bumps tile_counters[t] once
@@ -198,15 +198,15 @@ static RunResult run_overlap(const Weights& w, float* output, const AttnParams& 
 // stream memory op (no host involvement, no SM spinning), so projection and
 // AllReduce of tile t start as soon as its rows exist while later tiles are
 // still computing at full-GPU efficiency.
-static RunResult run_stream(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
+static double run_stream(const Weights& w, float* output, const AttnParams& p, const RunCtx& c)
 {
-    void* O_all = nullptr;
+    float* O_all = nullptr;
     float* send_buf = nullptr;
     int* counters = nullptr;
-    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * o_elem_bytes(p)));
+    CUDA_CHECK(cudaMalloc(&O_all,    (size_t)p.S * p.d_local * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&counters, (size_t)p.num_tiles * sizeof(int)));
-    AttnWorkspace ws = alloc_workspace(p, p.S);
+    FlashAttnTCPartials ws = alloc_workspace(p, p.S);
     const int target = blocks_per_tile(p);
 
     cudaEvent_t reset_done;
@@ -228,7 +228,7 @@ static RunResult run_stream(const Weights& w, float* output, const AttnParams& p
         CU_CHECK(cuStreamWaitValue32((CUstream)c.proj_stream,
                                      (CUdeviceptr)(counters + t), (cuuint32_t)target,
                                      CU_STREAM_WAIT_VALUE_GEQ));
-        void* O_t = static_cast<char*>(O_all) + (size_t)t * p.tile * p.d_local * o_elem_bytes(p);
+        float* O_t = O_all + (size_t)t * p.tile * p.d_local;
         launch_combine(ws, O_t, t * p.tile, p.tile, p, c.proj_stream);
         project(c, w, O_t, send_buf + (size_t)t * p.tile * p.d, p.tile, p);
         CUDA_CHECK(cudaEventRecord(proj_done[t], c.proj_stream));
@@ -242,7 +242,7 @@ static RunResult run_stream(const Weights& w, float* output, const AttnParams& p
     CUDA_CHECK(cudaStreamSynchronize(c.proj_stream));
     sync_comm_streams(c);
 
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
 
     CUDA_CHECK(cudaEventDestroy(reset_done));
     for (int t = 0; t < p.num_tiles; t++)
@@ -251,12 +251,12 @@ static RunResult run_stream(const Weights& w, float* output, const AttnParams& p
     CUDA_CHECK(cudaFree(O_all));
     CUDA_CHECK(cudaFree(send_buf));
     CUDA_CHECK(cudaFree(counters));
-    return r;
+    return ms;
 }
 
 // Communication only: the per-tile AllReduces of a full pass, back to back on
 // communicator 0, nothing else in flight. Sweeping --tile gives t_allreduce(bytes).
-static RunResult run_comm_only(float* output, const AttnParams& p, const RunCtx& c)
+static double run_comm_only(float* output, const AttnParams& p, const RunCtx& c)
 {
     float* send_buf = nullptr;
     CUDA_CHECK(cudaMalloc(&send_buf, (size_t)p.S * p.d * sizeof(float)));
@@ -268,13 +268,13 @@ static RunResult run_comm_only(float* output, const AttnParams& p, const RunCtx&
         allreduce(c, 0, send_buf + (size_t)t * p.tile * p.d, output + (size_t)t * p.tile * p.d,
                   (size_t)p.tile * p.d, p);
     CUDA_CHECK(cudaStreamSynchronize(c.comm_streams[0]));
-    RunResult r; r.wall_ms = finish_timing(t0, c.comm);
+    double ms = finish_timing(t0, c.comm);
 
     CUDA_CHECK(cudaFree(send_buf));
-    return r;
+    return ms;
 }
 
-RunResult run_mode(int mode, const Weights& w, float* output,
+double run_mode(int mode, const Weights& w, float* output,
                    const AttnParams& p, const RunCtx& c)
 {
     switch (mode) {
@@ -288,5 +288,5 @@ RunResult run_mode(int mode, const Weights& w, float* output,
     }
     fprintf(stderr, "unknown mode %d\n", mode);
     MPI_Abort(MPI_COMM_WORLD, 1);
-    return RunResult{};
+    return 0.0;
 }
