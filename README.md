@@ -55,14 +55,3 @@ sbatch -N 2 perlmutter/bench.sbatch
 | `run_drivers.cu` | The execution modes: `attn`, `megatron` (one-shot), `sync`, `overlap` (one launch per tile), `stream` (this project) |
 | `attn_main.cu` | MPI/NCCL/cuBLAS setup |
 | `attn_tests.cu`, `attn_bench.cu` | Correctness tests and the benchmark driver |
-
-## Related work
-
-Tile-level overlap of compute with collectives is an active area, and the dataflow here has close relatives:
-
-- **FlashOverlap** (Hong et al., EuroSys '26) uses the same signal: GEMM tiles bump an atomic counter and unmodified NCCL calls are released when a group of tiles is done. It overlaps GEMMs rather than attention, waits with a polling kernel rather than `cuStreamWaitValue32`, and is evaluated on a single node.
-- **FastAttention** (Huawei, 2024) fuses attention and the output linear and AllReduces each block of query rows as it finishes, on Ascend NPUs, where a DMA engine moves the data so communication does not compete with compute.
-- **T3** (Pati et al., ASPLOS '24) proposes hardware that tracks stores to an output buffer and triggers DMA transfers, so communication uses no compute units.
-- GEMM-side overlap: Flux (fuses communication into GEMM kernels), PyTorch async tensor parallelism (copy-engine micro-pipelining), NVIDIA Transformer Engine's userbuffers overlap, and Domino.
-
-What this prototype adds is the combination: FlashAttention as the producer for head-parallel tensor parallelism on NVIDIA GPUs, a wait performed by the GPU front end with no polling kernel, several NCCL communicators in flight, results across nodes, and the measurement that NCCL's AllReduce needs whole SMs, which is why the overlap breaks even on one NVLink node.
