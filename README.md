@@ -4,25 +4,21 @@ A CUDA/NCCL prototype that overlaps tensor-parallel communication with FlashAtte
 
 ## The idea
 
-In standard tensor-parallel attention, each rank computes its local attention output, projects it through `W_O`, and then participates in an AllReduce to sum across ranks. These three steps run in sequence, so the AllReduce latency sits fully exposed on the critical path:
+In standard tensor-parallel attention, each rank computes its local attention output, projects it through `W_O`, and then participates in an AllReduce to sum across ranks. These three steps run in sequence, so the AllReduce latency sits fully exposed on the critical path.
 
-```
-[----- attention -----][- proj -][--- AllReduce ---]
-```
+<p align="center"><img src="docs/figures/tile_sweep.png" width="520" alt="FlashAttention sweeps K/V tiles for one block of query rows at a time; output rows finish top to bottom"></p>
 
 FlashAttention computes the output one block of query rows at a time, and each block produces a disjoint slice of output rows. A tile of rows is *finalized* the moment its K/V sweep completes. Because `W_O` is linear and the cross-rank reduction is a sum, projecting and reducing per tile gives the same result as doing it once at the end, but the communication now overlaps with compute:
 
-```
-[tile 0 attn][tile 1 attn][tile 2 attn]...
-             [proj 0     ][proj 1     ]...
-                          [AllReduce 0][AllReduce 1]...
-```
+![One-shot schedule vs stream schedule](docs/figures/schedule.svg)
 
 The pass then costs roughly `max(attention, communication)` instead of `attention + communication`.
 
 ## Headline result
 
 Measured 2026-10-10 on NERSC Perlmutter (A100-SXM4-40GB), `H=16`, `d_h=64`, heads split across GPUs. Wall-clock ms for attention + output projection + AllReduce, max over ranks, median of 5 trials. All rows come from one allocation (`results/core_*.csv`, rendered by `python3 bench_tables.py --headline results/core_*.csv`).
+
+![Headline results relative to the one-shot baseline](docs/figures/headline.svg)
 
 | setup | S | mask | attention only | one-shot (megatron) | stream (best tile) | speedup |
 |---|---|---|---|---|---|---|
@@ -51,6 +47,7 @@ Three takeaways:
 | `attn_main.cu/.cuh` | MPI/NCCL/cuBLAS setup, synthetic weights, Q/K/V projection, stream/communicator context |
 | `attn_tests.cu` | Every (kernel, mode) pair checked against a cuBLAS + materialized-softmax reference on relative error, on 1 or many ranks |
 | `attn_bench.cu` | Benchmark driver, prints CSV |
+| `docs/make_figures.py` | Draws the README figures from the result CSVs (standard library only) |
 | `bench_sweep.py`, `perlmutter/` | Sweep script, environment/build scripts and sbatch files for NERSC Perlmutter |
 
 ### Execution modes
@@ -167,4 +164,11 @@ These came out of `nsys` traces and the `--no_proj/--no_comm` isolation knobs. T
 
 ## Related work
 
-The pattern of overlapping tensor-parallel collectives with compute is implemented in production by NVIDIA Transformer Engine's `tp_comm_overlap` (userbuffers + persistent kernels), academically by CoCoNet and Flux, and in the FlashAttention repo's own `RowParallelLinear`. This prototype targets one step earlier in the pipeline: the seam between FlashAttention tile completion and the start of projection, exposed as a device-side completion counter that the projection stream waits on rather than as a fused kernel.
+Tile-level overlap of compute with collectives is an active area, and the dataflow here has close relatives:
+
+- **FlashOverlap** (Hong et al., EuroSys '26) uses the same signal: GEMM tiles bump an atomic counter and unmodified NCCL calls are released when a group of tiles is done. It overlaps GEMMs rather than attention, waits with a polling kernel rather than `cuStreamWaitValue32`, and is evaluated on a single node.
+- **FastAttention** (Huawei, 2024) fuses attention and the output linear and AllReduces each block of query rows as it finishes, on Ascend NPUs, where a DMA engine moves the data so communication does not compete with compute.
+- **T3** (Pati et al., ASPLOS '24) proposes hardware that tracks stores to an output buffer and triggers DMA transfers, so communication uses no compute units.
+- GEMM-side overlap: Flux (fuses communication into GEMM kernels), PyTorch async tensor parallelism (copy-engine micro-pipelining), NVIDIA Transformer Engine's userbuffers overlap, and Domino.
+
+What this prototype adds is the combination: FlashAttention as the producer for head-parallel tensor parallelism on NVIDIA GPUs, a wait performed by the GPU front end with no polling kernel, several NCCL communicators in flight, results across nodes, and the measurement that NCCL's AllReduce needs whole SMs, which is why the overlap breaks even on one NVLink node.
